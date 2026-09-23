@@ -1,0 +1,22 @@
+# Visual Studio user and cache files
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# CMake and local build output
+/out/
+/build/
+/cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+
+# Local application state
+imgui.ini
+
+# Operating system noise
+Thumbs.db
+Desktop.ini
