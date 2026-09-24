@@ -1,9 +1,18 @@
-// Dear ImGui + GLFW + OpenGL + LearnOpenGL model-loading test.
+// Qt MainWindow hosting the existing GLFW + OpenGL + Dear ImGui scene.
 
 #include <cfloat>
 #include <cstdio>
 #include <filesystem>
 #include <iostream>
+#include <QAction>
+#include <QApplication>
+#include <QMainWindow>
+#include <QMenu>
+#include <QMenuBar>
+#include <QStatusBar>
+#include <QTimer>
+#include <QWidget>
+#include <QWindow>
 #include <windows.h>
 #include <imm.h>
 
@@ -61,10 +70,90 @@ bool IsPhysicalKeyDown(int virtual_key)
     return (GetAsyncKeyState(virtual_key) & 0x8000) != 0;
 }
 
+void ClipCursorToClient(HWND window)
+{
+    RECT client_rect{};
+    if (!GetClientRect(window, &client_rect))
+        return;
+
+    POINT top_left{ client_rect.left, client_rect.top };
+    POINT bottom_right{ client_rect.right, client_rect.bottom };
+    if (!ClientToScreen(window, &top_left) ||
+        !ClientToScreen(window, &bottom_right))
+    {
+        return;
+    }
+
+    const RECT screen_rect{
+        top_left.x,
+        top_left.y,
+        bottom_right.x,
+        bottom_right.y
+    };
+    ClipCursor(&screen_rect);
+}
+
 void ProcessInput(GLFWwindow* window)
 {
     if (IsPhysicalKeyDown(VK_ESCAPE))
         glfwSetWindowShouldClose(window, GLFW_TRUE);
+
+    const HWND native_window = glfwGetWin32Window(window);
+    const HWND host_window = GetAncestor(native_window, GA_ROOT);
+
+    POINT cursor_position{};
+    RECT scene_rect{};
+    const bool has_cursor_position = GetCursorPos(&cursor_position) != FALSE;
+    const HWND window_under_cursor = has_cursor_position
+        ? WindowFromPoint(cursor_position)
+        : nullptr;
+    const HWND cursor_root = window_under_cursor != nullptr
+        ? GetAncestor(window_under_cursor, GA_ROOT)
+        : nullptr;
+    const bool cursor_over_scene =
+        cursor_root == host_window &&
+        GetWindowRect(native_window, &scene_rect) &&
+        PtInRect(&scene_rect, cursor_position);
+    const bool right_button_down =
+        cursor_over_scene && IsPhysicalKeyDown(VK_RBUTTON);
+
+    if (right_button_down && !camera_control)
+    {
+        camera_control = true;
+        first_mouse = true;
+        ClipCursorToClient(native_window);
+    }
+    else if (!right_button_down && camera_control)
+    {
+        camera_control = false;
+        ClipCursor(nullptr);
+    }
+
+    // Poll cursor position directly while RMB is held. A GLFW disabled-cursor
+    // mode cannot reliably capture relative motion from a Qt embedded HWND.
+    if (camera_control)
+    {
+        POINT current_position{};
+        if (GetCursorPos(&current_position))
+        {
+            const float mouse_x = static_cast<float>(current_position.x);
+            const float mouse_y = static_cast<float>(current_position.y);
+            if (first_mouse)
+            {
+                last_mouse_x = mouse_x;
+                last_mouse_y = mouse_y;
+                first_mouse = false;
+            }
+            else
+            {
+                camera.ProcessMouseMovement(
+                    mouse_x - last_mouse_x,
+                    last_mouse_y - mouse_y);
+                last_mouse_x = mouse_x;
+                last_mouse_y = mouse_y;
+            }
+        }
+    }
 
     // Use Win32 asynchronous keyboard state so the Chinese IME cannot turn
     // these movement keys into text composition events.
@@ -83,44 +172,7 @@ void FramebufferSizeCallback(GLFWwindow*, int width, int height)
     glViewport(0, 0, width, height);
 }
 
-void MouseButtonCallback(GLFWwindow* window, int button, int action, int)
-{
-    if (button != GLFW_MOUSE_BUTTON_RIGHT)
-        return;
 
-    if (action == GLFW_PRESS)
-    {
-        camera_control = true;
-        first_mouse = true;
-        glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
-    }
-    else if (action == GLFW_RELEASE)
-    {
-        camera_control = false;
-        glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
-    }
-}
-
-void MouseCallback(GLFWwindow*, double xpos, double ypos)
-{
-    if (!camera_control)
-        return;
-
-    const float mouse_x = static_cast<float>(xpos);
-    const float mouse_y = static_cast<float>(ypos);
-    if (first_mouse)
-    {
-        last_mouse_x = mouse_x;
-        last_mouse_y = mouse_y;
-        first_mouse = false;
-    }
-
-    const float x_offset = mouse_x - last_mouse_x;
-    const float y_offset = last_mouse_y - mouse_y;
-    last_mouse_x = mouse_x;
-    last_mouse_y = mouse_y;
-    camera.ProcessMouseMovement(x_offset, y_offset);
-}
 
 void ScrollCallback(GLFWwindow*, double, double y_offset)
 {
@@ -130,8 +182,10 @@ void ScrollCallback(GLFWwindow*, double, double y_offset)
 }
 } // namespace
 
-int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
+int main(int argc, char* argv[])
 {
+    QApplication app(argc, argv);
+
     glfwSetErrorCallback(GlfwErrorCallback);
     if (!glfwInit())
         return 1;
@@ -143,6 +197,8 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
 #ifdef __APPLE__
     glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
 #endif
+    glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
+    glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
 
     GLFWmonitor* primary_monitor = glfwGetPrimaryMonitor();
     const float content_scale =
@@ -163,8 +219,6 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
     glfwSwapInterval(1);
 
     glfwSetFramebufferSizeCallback(window, FramebufferSizeCallback);
-    glfwSetMouseButtonCallback(window, MouseButtonCallback);
-    glfwSetCursorPosCallback(window, MouseCallback);
     glfwSetScrollCallback(window, ScrollCallback);
 
     if (!gladLoadGLLoader(reinterpret_cast<GLADloadproc>(glfwGetProcAddress)))
@@ -227,14 +281,37 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
     float model_scale = 1.0f;
     glm::vec3 model_position(0.0f, 0.0f, 0.0f);
 
-    while (!glfwWindowShouldClose(window))
+    const auto renderFrame = [&]()
     {
+        glfwMakeContextCurrent(window);
+        glfwPollEvents();
+        if (glfwWindowShouldClose(window))
+        {
+            app.quit();
+            return;
+        }
+
         const float current_frame = static_cast<float>(glfwGetTime());
         delta_time = current_frame - last_frame;
         last_frame = current_frame;
-
-        glfwPollEvents();
         ProcessInput(window);
+        if (glfwWindowShouldClose(window))
+        {
+            app.quit();
+            return;
+        }
+
+        int window_width = 0;
+        int window_height = 0;
+        int display_width = 0;
+        int display_height = 0;
+        glfwGetWindowSize(window, &window_width, &window_height);
+        glfwGetFramebufferSize(window, &display_width, &display_height);
+        if (window_width <= 0 || window_height <= 0 ||
+            display_width <= 0 || display_height <= 0)
+        {
+            return;
+        }
 
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
@@ -296,10 +373,8 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
 
         ImGui::Render();
 
-        int display_width = 0;
-        int display_height = 0;
-        glfwGetFramebufferSize(window, &display_width, &display_height);
         glViewport(0, 0, display_width, display_height);
+
         glClearColor(clear_color.x, clear_color.y, clear_color.z, clear_color.w);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
@@ -323,13 +398,56 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
 
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         glfwSwapBuffers(window);
-    }
+    };
 
-    ImGui_ImplOpenGL3_Shutdown();
-    ImGui_ImplGlfw_Shutdown();
-    ImGui::DestroyContext();
+    int exit_code = 0;
+    {
+        QMainWindow mainWindow;
+        mainWindow.setWindowTitle(QStringLiteral("glSceneEditor"));
+        mainWindow.resize(kWindowWidth, kWindowHeight);
+
+        QWindow* glfwWindow = QWindow::fromWinId(
+            reinterpret_cast<WId>(native_window));
+        if (glfwWindow == nullptr)
+        {
+            ImGui_ImplOpenGL3_Shutdown();
+            ImGui_ImplGlfw_Shutdown();
+            ImGui::DestroyContext();
+            ImmAssociateContext(native_window, previous_ime_context);
+            glfwDestroyWindow(window);
+            glfwTerminate();
+            return 1;
+        }
+
+        QWidget* sceneArea = QWidget::createWindowContainer(glfwWindow, &mainWindow);
+        sceneArea->setFocusPolicy(Qt::StrongFocus);
+        mainWindow.setCentralWidget(sceneArea);
+
+        QMenu* fileMenu = mainWindow.menuBar()->addMenu(QStringLiteral("文件(&F)"));
+        QAction* quitAction = fileMenu->addAction(QStringLiteral("退出(&X)"));
+        QObject::connect(quitAction, &QAction::triggered, &app, &QApplication::quit);
+        mainWindow.statusBar()->showMessage(QStringLiteral("就绪"));
+
+        QTimer renderTimer;
+        renderTimer.setTimerType(Qt::PreciseTimer);
+        renderTimer.setInterval(8);
+        QObject::connect(&renderTimer, &QTimer::timeout, renderFrame);
+        QObject::connect(&app, &QApplication::aboutToQuit, &renderTimer, &QTimer::stop);
+
+        mainWindow.show();
+        glfwShowWindow(window);
+        renderTimer.start();
+        exit_code = app.exec();
+
+        renderTimer.stop();
+        ClipCursor(nullptr);
+        glfwMakeContextCurrent(window);
+        ImGui_ImplOpenGL3_Shutdown();
+        ImGui_ImplGlfw_Shutdown();
+        ImGui::DestroyContext();
+    }
     ImmAssociateContext(native_window, previous_ime_context);
     glfwDestroyWindow(window);
     glfwTerminate();
-    return 0;
+    return exit_code;
 }

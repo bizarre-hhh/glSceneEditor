@@ -1,9 +1,22 @@
-﻿# CMakeList.txt: imgui_study 的 CMake 项目，在此处包括源代码并定义
-# 项目特定的逻辑。
-#
+cmake_minimum_required(VERSION 3.16)
+project(glSceneEditor LANGUAGES C CXX)
 
-# GLFW and Dear ImGui are kept as source in the repository so the project can
-# be built without an additional package manager dependency.
+include(qt.cmake)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Use this machine's installed Qt kit when CMake has not received a Qt prefix
+# from Qt Creator, Visual Studio, or the command line.
+if (NOT CMAKE_PREFIX_PATH AND EXISTS "D:/Qt/Qt5.14.2/5.14.2/msvc2017_64/lib/cmake/Qt5")
+  list(PREPEND CMAKE_PREFIX_PATH "D:/Qt/Qt5.14.2/5.14.2/msvc2017_64")
+endif()
+
+find_package(QT NAMES Qt6 Qt5 REQUIRED COMPONENTS Widgets)
+find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Widgets)
+qt_standard_project_setup()
+
+# GLFW and Dear ImGui remain the renderer inside the Qt central widget.
 set(GLFW_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../3rd_party/glfw")
 set(IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../3rd_party/imgui")
 set(APP_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -31,8 +44,7 @@ else()
   message(FATAL_ERROR "This example currently uses the copied Windows Assimp binary.")
 endif()
 
-# 将源代码添加到此项目的可执行文件。
-add_executable(glSceneEditor WIN32
+set(PROJECT_SOURCES
   "main.cpp"
   "${IMGUI_DIR}/imgui.cpp"
   "${IMGUI_DIR}/imgui_demo.cpp"
@@ -45,6 +57,8 @@ add_executable(glSceneEditor WIN32
   "${STB_IMAGE_DIR}/src/stb_image.cpp"
 )
 
+qt_add_executable(glSceneEditor ${PROJECT_SOURCES})
+
 target_include_directories(glSceneEditor PRIVATE
   "${APP_SOURCE_DIR}"
   "${IMGUI_DIR}"
@@ -56,7 +70,20 @@ target_include_directories(glSceneEditor PRIVATE
 )
 
 target_compile_definitions(glSceneEditor PRIVATE _CRT_SECURE_NO_WARNINGS)
-target_link_libraries(glSceneEditor PRIVATE glfw OpenGL::GL imm32 assimp_prebuilt)
+if (MSVC)
+  target_compile_options(glSceneEditor PRIVATE /utf-8)
+endif()
+target_link_libraries(glSceneEditor PRIVATE
+  glfw
+  OpenGL::GL
+  imm32
+  assimp_prebuilt
+  Qt${QT_VERSION_MAJOR}::Widgets
+)
+
+if (WIN32)
+  set_target_properties(glSceneEditor PROPERTIES WIN32_EXECUTABLE TRUE)
+endif()
 
 set(MODEL_RESOURCE_OUTPUT_DIR "$<TARGET_FILE_DIR:glSceneEditor>/resources/asset/backpack")
 set(SHADER_RESOURCE_OUTPUT_DIR "$<TARGET_FILE_DIR:glSceneEditor>/resources/shaders")
@@ -75,9 +102,23 @@ add_custom_command(TARGET glSceneEditor POST_BUILD
     "${ASSIMP_DIR}/bin/assimp-vc140-mt.dll"
     "$<TARGET_FILE_DIR:glSceneEditor>/assimp-vc140-mt.dll"
 )
-
-if (CMAKE_VERSION VERSION_GREATER 3.12)
-  set_property(TARGET glSceneEditor PROPERTY CXX_STANDARD 20)
+if (WIN32)
+  get_target_property(_qt_core_release Qt${QT_VERSION_MAJOR}::Core IMPORTED_LOCATION_RELEASE)
+  if (NOT _qt_core_release)
+    get_target_property(_qt_core_release Qt${QT_VERSION_MAJOR}::Core IMPORTED_LOCATION)
+  endif()
+  if (_qt_core_release)
+    get_filename_component(_qt_bin_dir "${_qt_core_release}" DIRECTORY)
+  endif()
+  find_program(QT_WINDEPLOYQT_EXECUTABLE
+    NAMES windeployqt windeployqt.exe
+    HINTS "${_qt_bin_dir}" ${CMAKE_PREFIX_PATH}
+    PATH_SUFFIXES bin
+  )
+  if (QT_WINDEPLOYQT_EXECUTABLE)
+    add_custom_command(TARGET glSceneEditor POST_BUILD
+      COMMAND "${QT_WINDEPLOYQT_EXECUTABLE}" --no-translations "$<TARGET_FILE:glSceneEditor>"
+      COMMENT "Deploying Qt runtime files"
+    )
+  endif()
 endif()
-
-# TODO: 如有需要，请添加测试并安装目标。
