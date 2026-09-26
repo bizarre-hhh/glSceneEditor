@@ -21,34 +21,8 @@
 在 Visual Studio Developer PowerShell（确保 `cl`、`cmake` 和 `ninja` 可用）中运行：
 
 ```powershell
-git clone --recurse-submodules https://github.com/bizarre-hhh/glSceneEditor.git
+git clone https://github.com/bizarre-hhh/glSceneEditor.git
 cd glSceneEditor
-
-# 可选：只在工作目录中检出项目使用的 GLFW/ImGui 文件
-git -C 3rd_party/glfw sparse-checkout set --cone CMake deps include src
-$imguiFiles = @(
-  '/.editorconfig',
-  '/.gitattributes',
-  '/.gitignore',
-  '/imconfig.h',
-  '/imgui_demo.cpp',
-  '/imgui_draw.cpp',
-  '/imgui_internal.h',
-  '/imgui_tables.cpp',
-  '/imgui_widgets.cpp',
-  '/imgui.cpp',
-  '/imgui.h',
-  '/imstb_rectpack.h',
-  '/imstb_textedit.h',
-  '/imstb_truetype.h',
-  '/LICENSE.txt',
-  '/backends/imgui_impl_glfw.cpp',
-  '/backends/imgui_impl_glfw.h',
-  '/backends/imgui_impl_opengl3.cpp',
-  '/backends/imgui_impl_opengl3.h',
-  '/backends/imgui_impl_opengl3_loader.h'
-)
-$imguiFiles | git -C 3rd_party/imgui sparse-checkout set --no-cone --stdin
 
 cmake --preset x64-debug
 cmake --build out/build/x64-debug
@@ -56,13 +30,6 @@ cmake --build out/build/x64-debug
 
 也可以将 `x64-debug` 替换为 `x64-release`、`x86-debug` 或 `x86-release`。
 
-上面的稀疏检出会省去 GLFW 的文档、示例和测试，以及 ImGui 的文档、示例、辅助工具和未使用后端；保留构建所需源码、头文件、许可证和本项目使用的 ImGui 后端。设置只保存在本地子模块配置中，不改变上游子模块版本。若要恢复完整文件，运行：
-
-```powershell
-git -C 3rd_party/glfw sparse-checkout disable
-git -C 3rd_party/imgui sparse-checkout disable
-```
-
 ## 依赖
 
-GLFW 和 Dear ImGui 作为 Git 子模块管理；GLAD、GLM、Assimp 和 stb_image 位于 `3rd_party/` 目录中。当前项目编译 ImGui 核心代码，并使用 GLFW 输入和 OpenGL 3 后端；模型导入由 Assimp 提供，纹理解码由 stb_image 提供。
+GLFW、Dear ImGui、GLAD、GLM、Assimp 和 stb_image 的项目所需文件直接保存在 `3rd_party/` 目录中。项目编译 ImGui 核心代码，并使用 GLFW 输入和 OpenGL 3 后端；模型导入由 Assimp 提供，纹理解码由 stb_image 提供。
