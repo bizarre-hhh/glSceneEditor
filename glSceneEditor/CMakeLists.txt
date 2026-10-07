@@ -46,6 +46,9 @@ endif()
 
 set(PROJECT_SOURCES
   "main.cpp"
+  "scene_editor_window.cpp"
+  "scene_viewport.cpp"
+  "camera_controller.cpp"
   "${IMGUI_DIR}/imgui.cpp"
   "${IMGUI_DIR}/imgui_demo.cpp"
   "${IMGUI_DIR}/imgui_draw.cpp"
@@ -98,6 +101,18 @@ add_custom_command(TARGET glSceneEditor POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
     "${CMAKE_CURRENT_SOURCE_DIR}/../asset/shaders/model.fs"
     "${SHADER_RESOURCE_OUTPUT_DIR}/model.fs"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "${CMAKE_CURRENT_SOURCE_DIR}/../asset/shaders/base_plate.vs"
+    "${SHADER_RESOURCE_OUTPUT_DIR}/base_plate.vs"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "${CMAKE_CURRENT_SOURCE_DIR}/../asset/shaders/base_plate.fs"
+    "${SHADER_RESOURCE_OUTPUT_DIR}/base_plate.fs"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "${CMAKE_CURRENT_SOURCE_DIR}/../asset/shaders/stl.vs"
+    "${SHADER_RESOURCE_OUTPUT_DIR}/stl.vs"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "${CMAKE_CURRENT_SOURCE_DIR}/../asset/shaders/stl.fs"
+    "${SHADER_RESOURCE_OUTPUT_DIR}/stl.fs"
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
     "${ASSIMP_DIR}/bin/assimp-vc140-mt.dll"
     "$<TARGET_FILE_DIR:glSceneEditor>/assimp-vc140-mt.dll"
