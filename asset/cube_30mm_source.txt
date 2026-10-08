@@ -1,5 +1,0 @@
-30 mm cube STL
-Source: https://github.com/elerac/stl-creator/blob/master/cube-ascii.stl
-Original author: Ryota MAEDA
-Changes: Scaled the 1-unit source cube uniformly to 30 STL coordinate units and translated Y so its bottom is at Y=0. Coordinates are intended as millimeters.
-License: MIT; see cube_30mm_LICENSE.txt.

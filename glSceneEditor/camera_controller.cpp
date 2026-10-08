@@ -37,9 +37,7 @@ void ClipCursorToClient(HWND window)
 
 CameraController::CameraController()
 {
-    const float size = BasePlate::kAxisLengthWorld;
-    SetSceneBounds({0.0f, 0.0f, 0.0f},
-                   {size, size, size});
+    SetSceneBounds(glm::vec3(0.0f), glm::vec3(0.0f));
     ResetView(16.0f / 9.0f);
 }
 
@@ -107,7 +105,6 @@ void CameraController::Update(GLFWwindow* window, bool capture_mouse,
         }
     }
 
-    const bool f_down = IsPhysicalKeyDown('F');
     const bool home_down = IsPhysicalKeyDown(VK_HOME);
     if (cursor_over_scene && !capture_keyboard)
     {
@@ -117,13 +114,11 @@ void CameraController::Update(GLFWwindow* window, bool capture_mouse,
         {
             const float aspect = static_cast<float>(client_rect.right - client_rect.left) /
                                  (client_rect.bottom - client_rect.top);
-            if (f_down && !f_was_down_)
-                FrameScene(aspect);
+
             if (home_down && !home_was_down_)
                 ResetView(aspect);
         }
     }
-    f_was_down_ = f_down;
     home_was_down_ = home_down;
 }
 
@@ -142,18 +137,74 @@ void CameraController::ReleaseCursor()
 void CameraController::SetSceneBounds(const glm::vec3& minimum,
                                       const glm::vec3& maximum)
 {
-    scene_min_ = minimum;
-    scene_max_ = maximum;
+    content_min_ = minimum;
+    content_max_ = maximum;
+    scene_min_ = glm::min(minimum, glm::vec3(0.0f));
+    scene_max_ = glm::max(maximum, glm::vec3(BasePlate::kAxisLengthWorld));
 }
 
-void CameraController::FrameScene(float aspect)
-{
-    camera_.FrameBounds(scene_min_, scene_max_, aspect);
-}
 
 void CameraController::ResetView(float aspect)
 {
     // Look along +Y so the plate's +X edge runs horizontally on screen.
     camera_.SetRotation(-90.0f, 35.0f);
-    FrameScene(aspect);
+    camera_.FrameBounds(scene_min_, scene_max_, aspect);
+
+    // A lower observation center raises the plate in the viewport. Fit the
+    // actual plate, axes and model instead of the much larger enclosing sphere.
+    glm::vec3 target = camera_.Target();
+    target.z = scene_min_.z + (scene_max_.z - scene_min_.z) * 0.25f;
+    camera_.SetTarget(target);
+    const glm::mat3 rotation(camera_.GetViewMatrix());
+    const float half_fov = std::tan(glm::radians(camera_.Zoom()) * 0.5f);
+    const float horizontal_limit = half_fov * std::max(aspect, 0.01f) * 0.84f;
+    const float upper_limit = half_fov * 0.76f;
+    const float lower_limit = half_fov * 0.78f;
+    float distance = 0.05f;
+    const auto include_point = [&](const glm::vec3& point)
+    {
+        const glm::vec3 view_point = rotation * (point - target);
+        const float horizontal_distance = std::abs(view_point.x) / horizontal_limit;
+        const float vertical_distance = view_point.y >= 0.0f
+            ? view_point.y / upper_limit : -view_point.y / lower_limit;
+        distance = std::max(distance, view_point.z +
+                           std::max(horizontal_distance, vertical_distance));
+    };
+    const auto include_box = [&](const glm::vec3& minimum, const glm::vec3& maximum)
+    {
+        for (int corner = 0; corner < 8; ++corner)
+            include_point({corner & 1 ? maximum.x : minimum.x,
+                           corner & 2 ? maximum.y : minimum.y,
+                           corner & 4 ? maximum.z : minimum.z});
+    };
+    include_box(content_min_, content_max_);
+    include_box(glm::vec3(0.0f),
+                {BasePlate::kSizeWorld, BasePlate::kSizeWorld, 0.0f});
+    // Include the width of the solid axis shafts and arrowheads, with room
+    // around the projected tips for their on-screen letter markers.
+    constexpr float axis_radius = 0.2f;
+    const float length = BasePlate::kAxisLengthWorld;
+    const float axis_z = BasePlate::kHorizontalAxisZ;
+    include_box({0.0f, -axis_radius, axis_z - axis_radius},
+                {length, axis_radius, axis_z + axis_radius});
+    include_box({-axis_radius, 0.0f, axis_z - axis_radius},
+                {axis_radius, length, axis_z + axis_radius});
+    include_box({-axis_radius, -axis_radius, 0.0f},
+                {axis_radius, axis_radius, length});
+    camera_.SetDistance(distance);
+}
+
+void CameraController::SetStandardView(StandardView view)
+{
+    ReleaseCursor();
+    switch (view)
+    {
+    case StandardView::Front:  camera_.SetRotation(-90.0f, 0.0f); break;
+    case StandardView::Back:   camera_.SetRotation(90.0f, 0.0f); break;
+    case StandardView::Left:   camera_.SetRotation(180.0f, 0.0f); break;
+    case StandardView::Right:  camera_.SetRotation(0.0f, 0.0f); break;
+    case StandardView::Top:    camera_.SetRotation(-90.0f, 90.0f); break;
+    case StandardView::Bottom: camera_.SetRotation(-90.0f, -90.0f); break;
+    }
+    camera_.SetOrthographic(true);
 }

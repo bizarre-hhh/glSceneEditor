@@ -7,6 +7,7 @@
 #include <cmath>
 #include <vector>
 
+#include "camera.h"
 #include "shader.h"
 
 // Scene scale: one OpenGL world unit represents 10 mm.
@@ -81,9 +82,9 @@ public:
     }
 
     void Draw(Shader& shader, const glm::mat4& view,
-              const glm::mat4& projection, float camera_z) const
+              const glm::mat4& projection, const Camera& camera) const
     {
-        const bool viewed_from_below = camera_z <= 0.0f;
+        const bool viewed_from_below = camera.Position().z <= 0.0f;
         shader.use();
         shader.setMat4("view", view);
         shader.setMat4("projection", projection);
@@ -91,7 +92,11 @@ public:
         shader.setFloat("zOffset", 0.0f);
 
         glBindVertexArray(axis_vao_);
-        glDrawArrays(GL_TRIANGLES, 0, axis_vertex_count_);
+        const GLsizei vertices_per_axis = axis_vertex_count_ / 3;
+        const glm::mat3 axis_directions(1.0f);
+        for (int axis = 0; axis < 3; ++axis)
+            if (camera.IsAxisVisible(axis_directions[axis]))
+                glDrawArrays(GL_TRIANGLES, axis * vertices_per_axis, vertices_per_axis);
 
         shader.setFloat("alpha", viewed_from_below ? 0.5f : 1.0f);
 

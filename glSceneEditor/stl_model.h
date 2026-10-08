@@ -8,6 +8,9 @@
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
 #include <limits>
 #include <string>
 #include <vector>
@@ -20,6 +23,32 @@
 class StlModel
 {
 public:
+    struct LocalTransform
+    {
+        glm::vec3 translation_mm{0.0f};
+        glm::vec3 scale{1.0f};
+        glm::vec3 rotation_degrees{0.0f};
+    };
+
+    const LocalTransform& Transform() const { return local_transform_; }
+
+    void SetTranslationXY(const glm::vec2& translation_mm)
+    {
+        if (std::isfinite(translation_mm.x) && std::isfinite(translation_mm.y))
+        {
+            local_transform_.translation_mm.x = translation_mm.x;
+            local_transform_.translation_mm.y = translation_mm.y;
+        }
+    }
+
+    // World position uses the model's bounding-box center as its reference.
+    glm::vec3 WorldPositionMm() const
+    {
+        const glm::vec3 center = (bounds_min_ + bounds_max_) * 0.5f;
+        return glm::vec3(ModelMatrix() * glm::vec4(center, 1.0f)) *
+               BasePlate::kMmPerWorldUnit;
+    }
+
     bool Load(const std::string& path, std::string& error)
     {
         Assimp::Importer importer;
@@ -72,6 +101,10 @@ public:
         }
 
         vertex_count_ = static_cast<GLsizei>(vertices.size() / 6);
+        pick_vertices_.clear();
+        pick_vertices_.reserve(static_cast<std::size_t>(vertex_count_));
+        for (std::size_t i = 0; i < vertices.size(); i += 6)
+            pick_vertices_.emplace_back(vertices[i], vertices[i + 1], vertices[i + 2]);
         glGenVertexArrays(1, &vao_);
         glGenBuffers(1, &vbo_);
         glBindVertexArray(vao_);
@@ -88,20 +121,11 @@ public:
     }
 
     void Draw(Shader& shader, const glm::mat4& view,
-              const glm::mat4& projection) const
+              const glm::mat4& projection, bool selected = false) const
     {
-        const float world_units_per_mm = 1.0f / BasePlate::kMmPerWorldUnit;
-        const glm::vec3 center = (bounds_min_ + bounds_max_) * 0.5f;
-        const glm::vec3 offset(
-            BasePlate::kHalfSize - center.x * world_units_per_mm,
-            BasePlate::kHalfSize - center.y * world_units_per_mm,
-            -bounds_min_.z * world_units_per_mm);
-        glm::mat4 model(1.0f);
-        model = glm::translate(model, offset);
-        model = glm::scale(model, glm::vec3(world_units_per_mm));
-
         shader.use();
-        shader.setMat4("model", model);
+        shader.setMat4("model", ModelMatrix());
+        shader.setBool("selected", selected);
         shader.setMat4("view", view);
         shader.setMat4("projection", projection);
         glBindVertexArray(vao_);
@@ -109,15 +133,100 @@ public:
         glBindVertexArray(0);
     }
 
+    // Test the camera's near-to-far segment against the actual mesh. Use the
+    // same placement transform as drawing, including millimeters and Z offset.
+    bool IntersectsSegment(const glm::vec3& start, const glm::vec3& end,
+                           glm::vec3* hit_point = nullptr) const
+    {
+        glm::vec3 minimum(0.0f);
+        glm::vec3 maximum(0.0f);
+        GetWorldBounds(minimum, maximum);
+        const glm::vec3 segment = end - start;
+        float enter = 0.0f;
+        float leave = 1.0f;
+        for (int axis = 0; axis < 3; ++axis)
+        {
+            if (segment[axis] == 0.0f)
+            {
+                if (start[axis] < minimum[axis] || start[axis] > maximum[axis])
+                    return false;
+                continue;
+            }
+            float first = (minimum[axis] - start[axis]) / segment[axis];
+            float last = (maximum[axis] - start[axis]) / segment[axis];
+            if (first > last)
+                std::swap(first, last);
+            enter = std::max(enter, first);
+            leave = std::min(leave, last);
+            if (enter > leave)
+                return false;
+        }
+
+        const glm::mat4 inverse_model = glm::inverse(ModelMatrix());
+        const glm::vec3 local_start(inverse_model * glm::vec4(start, 1.0f));
+        const glm::vec3 local_end(inverse_model * glm::vec4(end, 1.0f));
+        const glm::vec3 local_segment = local_end - local_start;
+        const float length = glm::length(local_segment);
+        if (length <= 0.0f)
+            return false;
+        const glm::vec3 direction = local_segment / length;
+        constexpr float tolerance = 1.0e-6f;
+        float nearest_distance = std::numeric_limits<float>::max();
+        for (std::size_t i = 0; i + 2 < pick_vertices_.size(); i += 3)
+        {
+            const glm::vec3& vertex = pick_vertices_[i];
+            const glm::vec3 edge1 = pick_vertices_[i + 1] - vertex;
+            const glm::vec3 edge2 = pick_vertices_[i + 2] - vertex;
+            const glm::vec3 cross = glm::cross(direction, edge2);
+            const float determinant = glm::dot(edge1, cross);
+            const float scale = glm::length(edge1) * glm::length(edge2);
+            if (std::abs(determinant) <= 1.0e-7f * scale)
+                continue;
+
+            const float inverse_determinant = 1.0f / determinant;
+            const glm::vec3 offset = local_start - vertex;
+            const float u = glm::dot(offset, cross) * inverse_determinant;
+            if (u < -tolerance || u > 1.0f + tolerance)
+                continue;
+            const glm::vec3 perpendicular = glm::cross(offset, edge1);
+            const float v = glm::dot(direction, perpendicular) * inverse_determinant;
+            if (v < -tolerance || u + v > 1.0f + tolerance)
+                continue;
+            const float distance = glm::dot(edge2, perpendicular) * inverse_determinant;
+            if (distance >= 0.0f && distance <= length * (1.0f + tolerance))
+            {
+                if (hit_point == nullptr)
+                    return true;
+                nearest_distance = std::min(nearest_distance, distance);
+            }
+        }
+        if (nearest_distance == std::numeric_limits<float>::max())
+            return false;
+        *hit_point = glm::vec3(ModelMatrix() *
+            glm::vec4(local_start + direction * nearest_distance, 1.0f));
+        return true;
+    }
+
     glm::vec3 SizeMm() const { return bounds_max_ - bounds_min_; }
+    std::size_t TriangleCount() const
+    {
+        return static_cast<std::size_t>(vertex_count_) / 3;
+    }
 
     void GetWorldBounds(glm::vec3& minimum, glm::vec3& maximum) const
     {
-        const glm::vec3 size = SizeMm() / BasePlate::kMmPerWorldUnit;
-        minimum = glm::vec3(BasePlate::kHalfSize - size.x * 0.5f,
-                            BasePlate::kHalfSize - size.y * 0.5f, 0.0f);
-        maximum = glm::vec3(BasePlate::kHalfSize + size.x * 0.5f,
-                            BasePlate::kHalfSize + size.y * 0.5f, size.z);
+        const glm::mat4 matrix = ModelMatrix();
+        minimum = glm::vec3(std::numeric_limits<float>::max());
+        maximum = glm::vec3(std::numeric_limits<float>::lowest());
+        for (int corner = 0; corner < 8; ++corner)
+        {
+            const glm::vec3 point(corner & 1 ? bounds_max_.x : bounds_min_.x,
+                                  corner & 2 ? bounds_max_.y : bounds_min_.y,
+                                  corner & 4 ? bounds_max_.z : bounds_min_.z);
+            const glm::vec3 world(matrix * glm::vec4(point, 1.0f));
+            minimum = glm::min(minimum, world);
+            maximum = glm::max(maximum, world);
+        }
     }
 
     ~StlModel()
@@ -133,6 +242,32 @@ public:
     StlModel& operator=(const StlModel&) = delete;
 
 private:
+    glm::mat4 ModelMatrix() const
+    {
+        const float world_units_per_mm = 1.0f / BasePlate::kMmPerWorldUnit;
+        const glm::vec3 center = (bounds_min_ + bounds_max_) * 0.5f;
+        const glm::vec3 offset(
+            BasePlate::kHalfSize - center.x * world_units_per_mm,
+            BasePlate::kHalfSize - center.y * world_units_per_mm,
+            -bounds_min_.z * world_units_per_mm);
+        const glm::mat4 placement = glm::scale(
+            glm::translate(glm::mat4(1.0f), offset), glm::vec3(world_units_per_mm));
+        const glm::vec3 pivot(BasePlate::kHalfSize, BasePlate::kHalfSize,
+                              SizeMm().z * world_units_per_mm * 0.5f);
+        // Local transforms are relative to the imported placement, about the
+        // model center. Physical scale excludes the mm-to-world conversion.
+        glm::mat4 local = glm::translate(glm::mat4(1.0f), pivot);
+        local = glm::rotate(local, glm::radians(local_transform_.rotation_degrees.x), {1, 0, 0});
+        local = glm::rotate(local, glm::radians(local_transform_.rotation_degrees.y), {0, 1, 0});
+        local = glm::rotate(local, glm::radians(local_transform_.rotation_degrees.z), {0, 0, 1});
+        local = glm::translate(local, local_transform_.translation_mm * world_units_per_mm);
+        local = glm::scale(local, local_transform_.scale);
+        local = glm::translate(local, -pivot);
+        return local * placement;
+    }
+
+    LocalTransform local_transform_;
+    std::vector<glm::vec3> pick_vertices_;
     GLuint vao_ = 0;
     GLuint vbo_ = 0;
     GLsizei vertex_count_ = 0;

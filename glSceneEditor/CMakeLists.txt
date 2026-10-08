@@ -49,6 +49,7 @@ set(PROJECT_SOURCES
   "scene_editor_window.cpp"
   "scene_viewport.cpp"
   "camera_controller.cpp"
+  "view_cube.cpp"
   "${IMGUI_DIR}/imgui.cpp"
   "${IMGUI_DIR}/imgui_demo.cpp"
   "${IMGUI_DIR}/imgui_draw.cpp"
