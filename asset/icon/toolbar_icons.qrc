@@ -1,0 +1,16 @@
+<RCC>
+  <qresource prefix="/icons">
+    <file>file-plus.svg</file>
+    <file>folder-open.svg</file>
+    <file>save.svg</file>
+    <file>save-pen.svg</file>
+    <file>package-plus.svg</file>
+    <file>undo-2.svg</file>
+    <file>redo-2.svg</file>
+    <file>rotate-ccw-clock.svg</file>
+    <file>house.svg</file>
+    <file>settings.svg</file>
+    <file>ruler.svg</file>
+    <file>LICENSE-Lucide.txt</file>
+  </qresource>
+</RCC>

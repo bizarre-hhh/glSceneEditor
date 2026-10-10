@@ -18,6 +18,7 @@ public:
     void Update(GLFWwindow* window, bool capture_mouse, bool capture_keyboard);
     void OnScroll(float y_offset);
     void ReleaseCursor();
+    void SetPlateSizeMm(const glm::vec2& size_mm);
     void SetSceneBounds(const glm::vec3& minimum, const glm::vec3& maximum);
     void ResetView(float aspect);
     void SetStandardView(StandardView view);
@@ -26,6 +27,8 @@ private:
     enum class DragMode { None, Orbit, Pan };
 
     Camera camera_;
+    glm::vec2 plate_size_world_{0.0f};
+    glm::vec3 axis_lengths_world_{0.0f};
     glm::vec3 scene_min_{0.0f};
     glm::vec3 scene_max_{0.0f};
     glm::vec3 content_min_{0.0f};

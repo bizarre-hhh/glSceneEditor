@@ -13,6 +13,8 @@
 #include <vector>
 
 #include "camera_controller.h"
+#include "project_file.h"
+#include "model_transform.h"
 
 class BasePlate;
 class Shader;
@@ -46,6 +48,8 @@ public:
         std::uint64_t transform_revision = 0;
         ModelId id = 0;
         bool bounding_box_visible = false;
+        std::size_t source_file_size = 0;
+        glm::vec2 placement_center_mm{PlateDimensions::kDefaultMm * 0.5f};
     };
 
     SceneViewport();
@@ -59,6 +63,30 @@ public:
     bool RenderFrame(); // false requests application shutdown
     void ReleaseCursor();
     bool LoadStl(const std::string& path, std::string& error, glm::vec3& size_mm);
+    // Numeric edits are one step; Begin/End merge an entire gizmo gesture.
+    bool BeginModelTransform(ModelId id, TransformMode mode);
+    bool TransformModelTo(ModelId id, const ModelTransform& transform, TransformMode mode);
+    void EndModelTransform();
+    bool BeginModelMove(ModelId id) { return BeginModelTransform(id, TransformMode::Translate); }
+    bool MoveModelTo(ModelId id, const glm::vec3& translation_mm);
+    void EndModelMove() { EndModelTransform(); }
+    bool BeginTransformEditing(ModelId id, TransformMode mode);
+    void EndTransformEditing();
+    bool IsTransformEditing() const { return transform_editing_model_id_ != 0; }
+    void SetTransformMode(TransformMode mode);
+    TransformMode GetTransformMode() const { return transform_mode_; }
+    std::optional<glm::mat4> ModelGizmoMatrix(ModelId id) const;
+    bool TransformModelFromGizmo(ModelId id, const glm::mat4& matrix, TransformMode mode);
+    bool CanUndo() const;
+    bool CanRedo() const;
+    bool Undo(QString& error);
+    bool Redo(QString& error);
+    const std::vector<QString>& OperationHistory() const { return operation_history_; }
+    std::uint64_t HistoryRevision() const { return history_revision_; }
+    void NewProject();
+    ProjectData SnapshotProject() const;
+    bool ApplyProject(const ProjectData& project, QString& error);
+    std::uint64_t ProjectRevision() const { return project_revision_; }
     const StlModelInfo* CurrentModelInfo() const { return ModelInfo(active_model_id_); }
     const StlModelInfo* ModelInfo(ModelId id) const;
     std::vector<StlModelInfo> ModelInfos() const;
@@ -84,6 +112,8 @@ public:
     void RemoveStl() { RemoveStl(active_model_id_); }
     void RemoveStl(ModelId id);
 
+    glm::vec2 PlateSizeMm() const { return plate_size_mm_; }
+    bool SetPlateSizeMm(const glm::vec2& size_mm, QString& error);
     void ResetView();
     const Camera& GetCamera() const { return camera_controller_.GetCamera(); }
     void SetSettingsVisible(bool visible) { show_settings_ = visible; }
@@ -98,10 +128,49 @@ private:
         std::unique_ptr<StlModel> model;
         StlModelInfo info;
         std::uint64_t selection_order = 0;
+        QByteArray stl_data;
     };
+    struct SavedModel
+    {
+        StlModelInfo info;
+        QByteArray stl_data;
+        std::uint64_t selection_order = 0;
+        std::size_t index = 0;
+    };
+    enum class OperationKind { Import, Delete, Transform, PlateSize };
+    struct Operation
+    {
+        OperationKind kind = OperationKind::Import;
+        SavedModel model;
+        ModelTransform before_transform;
+        ModelTransform after_transform;
+        glm::vec2 before_plate_size{PlateDimensions::kDefaultMm};
+        glm::vec2 after_plate_size{PlateDimensions::kDefaultMm};
+        std::uint64_t before_revision = 0;
+        std::uint64_t after_revision = 0;
+        QString description;
+    };
+    struct PendingTransform
+    {
+        ModelId id = 0;
+        TransformMode mode = TransformMode::Translate;
+        ModelTransform before_transform;
+        std::uint64_t before_revision = 0;
+    };
+    SavedModel CaptureModel(const ModelEntry& entry) const;
+    bool RestoreModel(const SavedModel& saved, QString& error);
+    void EraseModel(ModelId id);
+    bool ApplyTransform(ModelEntry& entry, const ModelTransform& transform);
+    bool DrawModelGizmo(const glm::mat4& view, const glm::mat4& projection, bool over_cube);
+    void RecordOperation(Operation operation);
+    void AppendHistory(const QString& description);
+    void ClearHistory();
+    void AdvanceProjectRevision();
     ModelEntry* FindModel(ModelId id);
     const ModelEntry* FindModel(ModelId id) const;
     void ChooseActiveModel();
+    void ResetProjectDisplay();
+    void ApplyPlateSizeMm(const glm::vec2& size_mm);
     void RefreshSceneBounds();
     struct MouseRay
     {
@@ -113,7 +182,7 @@ private:
         ModelId id = 0;
         glm::vec3 anchor{0.0f};
         glm::vec3 plane_normal{0.0f, 0.0f, 1.0f};
-        glm::vec2 initial_translation_mm{0.0f};
+        glm::vec3 initial_translation_mm{0.0f};
     };
     std::optional<MouseRay> MouseRayAt(const glm::vec2& position,
                                      bool require_inside = true) const;
@@ -139,12 +208,24 @@ private:
     std::unique_ptr<Shader> stl_shader_;
     std::unique_ptr<Shader> plate_shader_;
     std::unique_ptr<BasePlate> base_plate_;
+    glm::vec2 plate_size_mm_{PlateDimensions::kDefaultMm};
     unsigned int bounds_vao_ = 0;
     unsigned int bounds_vbo_ = 0;
     std::vector<ModelEntry> models_;
     ModelId next_model_id_ = 1;
     ModelId active_model_id_ = 0;
     std::uint64_t model_state_revision_ = 0;
+    std::uint64_t next_selection_order_ = 1;
+    std::uint64_t project_revision_ = 0;
+    std::uint64_t next_project_revision_ = 1;
+    std::vector<Operation> operations_;
+    std::size_t operation_cursor_ = 0;
+    std::vector<QString> operation_history_;
+    std::uint64_t history_revision_ = 0;
+    std::optional<PendingTransform> pending_transform_;
+    ModelId transform_editing_model_id_ = 0;
+    TransformMode transform_mode_ = TransformMode::Translate;
+    bool gizmo_dragging_ = false;
     std::optional<glm::vec2> pending_pick_;
     std::optional<ModelDrag> model_drag_;
     ImFont* axis_label_font_ = nullptr;

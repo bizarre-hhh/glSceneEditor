@@ -1,6 +1,8 @@
 #ifndef STL_MODEL_H
 #define STL_MODEL_H
 
+#include "model_transform.h"
+
 #include <glad/glad.h>
 #include <assimp/Importer.hpp>
 #include <assimp/postprocess.h>
@@ -23,14 +25,13 @@
 class StlModel
 {
 public:
-    struct LocalTransform
-    {
-        glm::vec3 translation_mm{0.0f};
-        glm::vec3 scale{1.0f};
-        glm::vec3 rotation_degrees{0.0f};
-    };
+    using LocalTransform = ModelTransform;
+
+    void SetPlacementCenterMm(const glm::vec2& center_mm) { placement_center_mm_ = center_mm; }
+    glm::vec2 PlacementCenterMm() const { return placement_center_mm_; }
 
     const LocalTransform& Transform() const { return local_transform_; }
+    void SetTransform(const LocalTransform& transform) { local_transform_ = transform; }
 
     void SetTranslationXY(const glm::vec2& translation_mm)
     {
@@ -49,15 +50,15 @@ public:
                BasePlate::kMmPerWorldUnit;
     }
 
-    bool Load(const std::string& path, std::string& error)
+    bool LoadFromMemory(const char* data, std::size_t size, std::string& error)
     {
         Assimp::Importer importer;
-        const aiScene* scene = importer.ReadFile(
-            path,
+        const aiScene* scene = importer.ReadFileFromMemory(
+            data, size,
             aiProcess_Triangulate |
             aiProcess_GenNormals |
             aiProcess_PreTransformVertices |
-            aiProcess_ValidateDataStructure);
+            aiProcess_ValidateDataStructure, "stl");
         if (!scene || !scene->HasMeshes())
         {
             error = importer.GetErrorString();
@@ -83,6 +84,13 @@ public:
                     const unsigned int index = face.mIndices[corner];
                     const aiVector3D& position = mesh->mVertices[index];
                     const aiVector3D& normal = mesh->mNormals[index];
+                    if (!std::isfinite(position.x) || !std::isfinite(position.y) ||
+                        !std::isfinite(position.z) || !std::isfinite(normal.x) ||
+                        !std::isfinite(normal.y) || !std::isfinite(normal.z))
+                    {
+                        error = "The STL contains non-finite coordinates or normals.";
+                        return false;
+                    }
                     const glm::vec3 point(position.x, position.y, position.z);
                     bounds_min_ = glm::min(bounds_min_, point);
                     bounds_max_ = glm::max(bounds_max_, point);
@@ -247,12 +255,13 @@ private:
         const float world_units_per_mm = 1.0f / BasePlate::kMmPerWorldUnit;
         const glm::vec3 center = (bounds_min_ + bounds_max_) * 0.5f;
         const glm::vec3 offset(
-            BasePlate::kHalfSize - center.x * world_units_per_mm,
-            BasePlate::kHalfSize - center.y * world_units_per_mm,
+            placement_center_mm_.x * world_units_per_mm - center.x * world_units_per_mm,
+            placement_center_mm_.y * world_units_per_mm - center.y * world_units_per_mm,
             -bounds_min_.z * world_units_per_mm);
         const glm::mat4 placement = glm::scale(
             glm::translate(glm::mat4(1.0f), offset), glm::vec3(world_units_per_mm));
-        const glm::vec3 pivot(BasePlate::kHalfSize, BasePlate::kHalfSize,
+        const glm::vec3 pivot(placement_center_mm_.x * world_units_per_mm,
+                              placement_center_mm_.y * world_units_per_mm,
                               SizeMm().z * world_units_per_mm * 0.5f);
         // Local transforms are relative to the imported placement, about the
         // model center. Physical scale excludes the mm-to-world conversion.
@@ -266,6 +275,7 @@ private:
         return local * placement;
     }
 
+    glm::vec2 placement_center_mm_{PlateDimensions::kDefaultMm * 0.5f};
     LocalTransform local_transform_;
     std::vector<glm::vec3> pick_vertices_;
     GLuint vao_ = 0;

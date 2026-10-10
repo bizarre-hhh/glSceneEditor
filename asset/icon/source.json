@@ -1,0 +1,19 @@
+{
+  "library": "Lucide",
+  "repository": "https://github.com/lucide-icons/lucide",
+  "commit": "a04f228cd01185e09c188b7227b9600c08c565ec",
+  "icons": [
+    "file-plus",
+    "folder-open",
+    "save",
+    "save-pen",
+    "package-plus",
+    "undo-2",
+    "redo-2",
+    "rotate-ccw-clock",
+    "house",
+    "settings",
+    "ruler"
+  ],
+  "changes": "SVG stroke changed from currentColor to #334155 for Qt; geometry unchanged."
+}

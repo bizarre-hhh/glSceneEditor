@@ -4,36 +4,49 @@
 #include <glad/glad.h>
 #include <glm/glm.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <vector>
 
 #include "camera.h"
+#include "plate_dimensions.h"
 #include "shader.h"
 
 // Scene scale: one OpenGL world unit represents 10 mm.
 class BasePlate
 {
 public:
-    static constexpr int kSizeMm = 100;
     static constexpr int kGridStepMm = 10;
     static constexpr float kMmPerWorldUnit = 10.0f;
-    static constexpr float kSizeWorld = kSizeMm / kMmPerWorldUnit;
-    static constexpr float kHalfSize = kSizeWorld * 0.5f;
-    static constexpr float kAxisLengthWorld = 1.2f * kSizeWorld; // 120 mm
-    static constexpr float kZAxisHeight = kAxisLengthWorld;
     static constexpr float kHorizontalAxisZ = 0.065f;
 
-    BasePlate()
+    explicit BasePlate(const glm::vec2& size_mm = glm::vec2(PlateDimensions::kDefaultMm))
     {
+        SetSize(size_mm);
+    }
+    ~BasePlate() { Release(); }
+
+    glm::vec2 SizeMm() const { return size_mm_; }
+    glm::vec2 SizeWorld() const { return size_mm_ / kMmPerWorldUnit; }
+    static glm::vec3 AxisLengthsForSize(const glm::vec2& size_mm)
+    {
+        const glm::vec2 size = size_mm / kMmPerWorldUnit;
+        return {1.2f * size.x, 1.2f * size.y, 1.2f * std::max(size.x, size.y)};
+    }
+    glm::vec3 AxisLengthsWorld() const { return AxisLengthsForSize(size_mm_); }
+
+    // Reuse the same OpenGL buffers when changing the rectangular plate.
+    void SetSize(const glm::vec2& size_mm)
+    {
+        size_mm_ = size_mm;
+        const glm::vec2 size = SizeWorld();
+        const float length = size.x, width = size.y;
         std::vector<float> faces;
         const glm::vec3 top_color(0.18f, 0.19f, 0.21f);
-        const float size = kSizeWorld;
-
-        // The plate lies in the XY plane, with its origin at the (0, 0) corner.
-        AddTriangle(faces, {0.0f, 0.0f, 0.0f}, {size, 0.0f, 0.0f},
-                    {size, size, 0.0f}, top_color);
-        AddTriangle(faces, {0.0f, 0.0f, 0.0f}, {size, size, 0.0f},
-                    {0.0f, size, 0.0f}, top_color);
+        AddTriangle(faces, {0.0f, 0.0f, 0.0f}, {length, 0.0f, 0.0f},
+                    {length, width, 0.0f}, top_color);
+        AddTriangle(faces, {0.0f, 0.0f, 0.0f}, {length, width, 0.0f},
+                    {0.0f, width, 0.0f}, top_color);
         face_vertex_count_ = static_cast<GLsizei>(faces.size() / 6);
         Upload(faces, face_vao_, face_vbo_);
 
@@ -41,42 +54,37 @@ public:
         const glm::vec3 grid_color(0.29f, 0.31f, 0.34f);
         const glm::vec3 edge_color(0.54f, 0.57f, 0.61f);
         const float line_z = 0.003f;
-        for (int mm = kGridStepMm; mm < kSizeMm; mm += kGridStepMm)
-        {
-            const float position = mm / kMmPerWorldUnit;
-            AddLine(lines, {0.0f, position, line_z},
-                    {size, position, line_z}, grid_color);
-            AddLine(lines, {position, 0.0f, line_z},
-                    {position, size, line_z}, grid_color);
-        }
+        for (int mm = kGridStepMm; mm < size_mm.x; mm += kGridStepMm)
+            AddLine(lines, {mm / kMmPerWorldUnit, 0.0f, line_z},
+                    {mm / kMmPerWorldUnit, width, line_z}, grid_color);
+        for (int mm = kGridStepMm; mm < size_mm.y; mm += kGridStepMm)
+            AddLine(lines, {0.0f, mm / kMmPerWorldUnit, line_z},
+                    {length, mm / kMmPerWorldUnit, line_z}, grid_color);
 
-        // Short half-step marks along two edges make the 5 mm scale readable.
-        for (int mm = 5; mm < kSizeMm; mm += 5)
-        {
-            if (mm % kGridStepMm == 0)
-                continue;
-            const float position = mm / kMmPerWorldUnit;
-            AddLine(lines, {position, size, line_z},
-                    {position, size - 0.18f, line_z}, edge_color);
-            AddLine(lines, {size, position, line_z},
-                    {size - 0.18f, position, line_z}, edge_color);
-        }
-        AddLine(lines, {0.0f, 0.0f, line_z}, {size, 0.0f, line_z}, edge_color);
-        AddLine(lines, {size, 0.0f, line_z}, {size, size, line_z}, edge_color);
-        AddLine(lines, {size, size, line_z}, {0.0f, size, line_z}, edge_color);
-        AddLine(lines, {0.0f, size, line_z}, {0.0f, 0.0f, line_z}, edge_color);
+        const float x_mark = std::min(0.18f, length * 0.2f);
+        const float y_mark = std::min(0.18f, width * 0.2f);
+        for (int mm = 5; mm < size_mm.x; mm += 5)
+            if (mm % kGridStepMm != 0)
+                AddLine(lines, {mm / kMmPerWorldUnit, width, line_z},
+                        {mm / kMmPerWorldUnit, width - y_mark, line_z}, edge_color);
+        for (int mm = 5; mm < size_mm.y; mm += 5)
+            if (mm % kGridStepMm != 0)
+                AddLine(lines, {length, mm / kMmPerWorldUnit, line_z},
+                        {length - x_mark, mm / kMmPerWorldUnit, line_z}, edge_color);
+        AddLine(lines, {0.0f, 0.0f, line_z}, {length, 0.0f, line_z}, edge_color);
+        AddLine(lines, {length, 0.0f, line_z}, {length, width, line_z}, edge_color);
+        AddLine(lines, {length, width, line_z}, {0.0f, width, line_z}, edge_color);
+        AddLine(lines, {0.0f, width, line_z}, {0.0f, 0.0f, line_z}, edge_color);
         line_vertex_count_ = static_cast<GLsizei>(lines.size() / 6);
         Upload(lines, line_vao_, line_vbo_);
 
-        // The horizontal shafts skim the plate; their arrowheads start beyond
-        // its edges. The Z axis rises from the same corner.
         std::vector<float> axes;
+        const glm::vec3 axis_lengths = AxisLengthsWorld();
         AddAxis(axes, {0.0f, 0.0f, kHorizontalAxisZ},
-                {kAxisLengthWorld, 0.0f, kHorizontalAxisZ}, kXColor);
+                {axis_lengths.x, 0.0f, kHorizontalAxisZ}, kXColor);
         AddAxis(axes, {0.0f, 0.0f, kHorizontalAxisZ},
-                {0.0f, kAxisLengthWorld, kHorizontalAxisZ}, kYColor);
-        AddAxis(axes, {0.0f, 0.0f, 0.0f},
-                {0.0f, 0.0f, kZAxisHeight}, kZColor);
+                {0.0f, axis_lengths.y, kHorizontalAxisZ}, kYColor);
+        AddAxis(axes, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, axis_lengths.z}, kZColor);
         axis_vertex_count_ = static_cast<GLsizei>(axes.size() / 6);
         Upload(axes, axis_vao_, axis_vbo_);
     }
@@ -132,6 +140,8 @@ public:
         glDeleteVertexArrays(1, &face_vao_);
         glDeleteVertexArrays(1, &line_vao_);
         glDeleteVertexArrays(1, &axis_vao_);
+        face_vbo_ = line_vbo_ = axis_vbo_ = 0;
+        face_vao_ = line_vao_ = axis_vao_ = 0;
     }
 
     BasePlate(const BasePlate&) = delete;
@@ -169,7 +179,11 @@ private:
     {
         constexpr float kTwoPi = 6.28318530718f;
         const glm::vec3 direction = glm::normalize(tip - start);
-        const glm::vec3 cone_base = tip - direction * kAxisConeLength;
+        const float axis_length = glm::length(tip - start);
+        const float shaft_radius = std::min(kAxisShaftRadius, axis_length * 0.04f);
+        const float cone_radius = std::min(kAxisConeRadius, axis_length * 0.12f);
+        const float cone_length = std::min(kAxisConeLength, axis_length * 0.3f);
+        const glm::vec3 cone_base = tip - direction * cone_length;
 
         for (int side = 0; side < kAxisSides; ++side)
         {
@@ -179,17 +193,17 @@ private:
             const glm::vec3 radial1 = AxisRadial(direction, angle1);
             const glm::vec3 normal = glm::normalize(radial0 + radial1);
             const glm::vec3 shaft_color = LitAxisColor(color, normal);
-            const glm::vec3 p0 = start + radial0 * kAxisShaftRadius;
-            const glm::vec3 p1 = start + radial1 * kAxisShaftRadius;
-            const glm::vec3 p2 = cone_base + radial1 * kAxisShaftRadius;
-            const glm::vec3 p3 = cone_base + radial0 * kAxisShaftRadius;
+            const glm::vec3 p0 = start + radial0 * shaft_radius;
+            const glm::vec3 p1 = start + radial1 * shaft_radius;
+            const glm::vec3 p2 = cone_base + radial1 * shaft_radius;
+            const glm::vec3 p3 = cone_base + radial0 * shaft_radius;
             AddTriangle(data, p0, p1, p2, shaft_color);
             AddTriangle(data, p0, p2, p3, shaft_color);
 
-            const glm::vec3 cone0 = cone_base + radial0 * kAxisConeRadius;
-            const glm::vec3 cone1 = cone_base + radial1 * kAxisConeRadius;
+            const glm::vec3 cone0 = cone_base + radial0 * cone_radius;
+            const glm::vec3 cone1 = cone_base + radial1 * cone_radius;
             const glm::vec3 cone_normal = glm::normalize(
-                normal * kAxisConeLength + direction * kAxisConeRadius);
+                normal * cone_length + direction * cone_radius);
             AddTriangle(data, cone0, cone1, tip,
                         LitAxisColor(color, cone_normal));
 
@@ -224,8 +238,10 @@ private:
 
     static void Upload(const std::vector<float>& data, GLuint& vao, GLuint& vbo)
     {
-        glGenVertexArrays(1, &vao);
-        glGenBuffers(1, &vbo);
+        if (vao == 0)
+            glGenVertexArrays(1, &vao);
+        if (vbo == 0)
+            glGenBuffers(1, &vbo);
         glBindVertexArray(vao);
         glBindBuffer(GL_ARRAY_BUFFER, vbo);
         glBufferData(GL_ARRAY_BUFFER, data.size() * sizeof(float),
@@ -238,6 +254,7 @@ private:
         glBindVertexArray(0);
     }
 
+    glm::vec2 size_mm_{PlateDimensions::kDefaultMm};
     GLuint face_vao_ = 0;
     GLuint face_vbo_ = 0;
     GLuint line_vao_ = 0;

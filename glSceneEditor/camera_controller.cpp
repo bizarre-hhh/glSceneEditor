@@ -37,7 +37,7 @@ void ClipCursorToClient(HWND window)
 
 CameraController::CameraController()
 {
-    SetSceneBounds(glm::vec3(0.0f), glm::vec3(0.0f));
+    SetPlateSizeMm(glm::vec2(PlateDimensions::kDefaultMm));
     ResetView(16.0f / 9.0f);
 }
 
@@ -134,13 +134,20 @@ void CameraController::ReleaseCursor()
     drag_mode_ = DragMode::None;
 }
 
+void CameraController::SetPlateSizeMm(const glm::vec2& size_mm)
+{
+    plate_size_world_ = size_mm / BasePlate::kMmPerWorldUnit;
+    axis_lengths_world_ = BasePlate::AxisLengthsForSize(size_mm);
+    SetSceneBounds(content_min_, content_max_);
+}
+
 void CameraController::SetSceneBounds(const glm::vec3& minimum,
                                       const glm::vec3& maximum)
 {
     content_min_ = minimum;
     content_max_ = maximum;
     scene_min_ = glm::min(minimum, glm::vec3(0.0f));
-    scene_max_ = glm::max(maximum, glm::vec3(BasePlate::kAxisLengthWorld));
+    scene_max_ = glm::max(maximum, axis_lengths_world_);
 }
 
 
@@ -179,18 +186,17 @@ void CameraController::ResetView(float aspect)
     };
     include_box(content_min_, content_max_);
     include_box(glm::vec3(0.0f),
-                {BasePlate::kSizeWorld, BasePlate::kSizeWorld, 0.0f});
+                {plate_size_world_.x, plate_size_world_.y, 0.0f});
     // Include the width of the solid axis shafts and arrowheads, with room
     // around the projected tips for their on-screen letter markers.
     constexpr float axis_radius = 0.2f;
-    const float length = BasePlate::kAxisLengthWorld;
     const float axis_z = BasePlate::kHorizontalAxisZ;
     include_box({0.0f, -axis_radius, axis_z - axis_radius},
-                {length, axis_radius, axis_z + axis_radius});
+                {axis_lengths_world_.x, axis_radius, axis_z + axis_radius});
     include_box({-axis_radius, 0.0f, axis_z - axis_radius},
-                {axis_radius, length, axis_z + axis_radius});
+                {axis_radius, axis_lengths_world_.y, axis_z + axis_radius});
     include_box({-axis_radius, -axis_radius, 0.0f},
-                {axis_radius, axis_radius, length});
+                {axis_radius, axis_radius, axis_lengths_world_.z});
     camera_.SetDistance(distance);
 }
 

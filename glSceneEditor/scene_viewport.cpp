@@ -7,6 +7,8 @@
 #include <cstdio>
 #include <filesystem>
 #include <iostream>
+#include <QFile>
+#include <QFileInfo>
 #define NOMINMAX
 #include <windows.h>
 #include <imm.h>
@@ -20,6 +22,7 @@
 #include <glm/gtc/type_ptr.hpp>
 
 #include "imgui.h"
+#include "ImGuizmo.h"
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_opengl3.h"
 #include "base_plate.h"
@@ -67,7 +70,8 @@ bool ProjectToScreen(const glm::vec3& point, const glm::mat4& view_projection,
     return true;
 }
 
-void DrawAxisLabels(ImFont* font, const Camera& camera, const glm::mat4& view_projection)
+void DrawAxisLabels(ImFont* font, const Camera& camera, const glm::mat4& view_projection,
+                    const BasePlate& plate)
 {
     if (font == nullptr)
         return;
@@ -81,7 +85,7 @@ void DrawAxisLabels(ImFont* font, const Camera& camera, const glm::mat4& view_pr
     const float tip_gap = 27.0f * dpi_scale;
     const float label_padding = 7.0f * dpi_scale;
     const float rim_width = 2.5f * dpi_scale;
-    const float axis_length = BasePlate::kAxisLengthWorld;
+    const glm::vec3 axis_lengths = plate.AxisLengthsWorld();
     const glm::vec3 origin(0.0f, 0.0f, 0.0f);
     struct AxisLabel
     {
@@ -91,13 +95,13 @@ void DrawAxisLabels(ImFont* font, const Camera& camera, const glm::mat4& view_pr
         ImU32 rim_color;
     };
     const AxisLabel labels[] = {
-        {"X", {axis_length, 0.0f, BasePlate::kHorizontalAxisZ},
+        {"X", {axis_lengths.x, 0.0f, BasePlate::kHorizontalAxisZ},
          {0.0f, 0.0f, BasePlate::kHorizontalAxisZ},
          IM_COL32(255, 92, 86, 255)},
-        {"Y", {0.0f, axis_length, BasePlate::kHorizontalAxisZ},
+        {"Y", {0.0f, axis_lengths.y, BasePlate::kHorizontalAxisZ},
          {0.0f, 0.0f, BasePlate::kHorizontalAxisZ},
          IM_COL32(80, 225, 105, 255)},
-        {"Z", {0.0f, 0.0f, axis_length}, origin,
+        {"Z", {0.0f, 0.0f, axis_lengths.z}, origin,
          IM_COL32(95, 154, 255, 255)},
     };
 
@@ -220,6 +224,16 @@ bool SceneViewport::Initialize()
     ImGuiStyle& style = ImGui::GetStyle();
     style.ScaleAllSizes(content_scale);
     style.FontScaleDpi = content_scale;
+    auto& gizmo_style = ImGuizmo::GetStyle();
+    gizmo_style = ImGuizmo::Style();
+    gizmo_style.TranslationLineThickness = 3.0f * content_scale;
+    gizmo_style.TranslationLineArrowSize = 7.0f * content_scale;
+    gizmo_style.RotationLineThickness = 3.0f * content_scale;
+    gizmo_style.ScaleLineThickness = 3.0f * content_scale;
+    gizmo_style.ScaleLineCircleSize = 7.0f * content_scale;
+    gizmo_style.CenterCircleSize = 6.0f * content_scale;
+    gizmo_style.HatchedAxisLineThickness = 4.0f * content_scale;
+    gizmo_style.Colors[ImGuizmo::SELECTION] = ImVec4(1.0f, 0.85f, 0.15f, 1.0f);
     style.GrabMinSize = 16.0f;
     style.Colors[ImGuiCol_FrameBg] = ImVec4(0.12f, 0.14f, 0.18f, 1.0f);
     style.Colors[ImGuiCol_FrameBgHovered] = ImVec4(0.18f, 0.22f, 0.30f, 1.0f);
@@ -250,7 +264,7 @@ bool SceneViewport::Initialize()
         std::cerr << "Failed to link scene shaders.\n";
         return false;
     }
-    base_plate_ = std::make_unique<BasePlate>();
+    base_plate_ = std::make_unique<BasePlate>(plate_size_mm_);
 
     // Bounds share the plate's unlit position/color shader and one line buffer.
     glGenVertexArrays(1, &bounds_vao_);
@@ -287,7 +301,7 @@ void SceneViewport::ScrollCallback(GLFWwindow* window, double, double y_offset)
     if (ImGui::GetCurrentContext() != nullptr && ImGui::GetIO().WantCaptureMouse)
         return;
     auto* self = static_cast<SceneViewport*>(glfwGetWindowUserPointer(window));
-    if (self != nullptr && !self->model_drag_)
+    if (self != nullptr && !self->model_drag_ && !ImGuizmo::IsUsingAny() && !ImGuizmo::IsOver())
         self->camera_controller_.OnScroll(static_cast<float>(y_offset));
 }
 
@@ -297,7 +311,7 @@ void SceneViewport::MouseButtonCallback(GLFWwindow* window, int button,
     if (button != GLFW_MOUSE_BUTTON_LEFT || action != GLFW_PRESS)
         return;
     auto* self = static_cast<SceneViewport*>(glfwGetWindowUserPointer(window));
-    if (self == nullptr)
+    if (self == nullptr || self->IsTransformEditing())
         return;
     double x = 0.0;
     double y = 0.0;
@@ -445,7 +459,11 @@ bool SceneViewport::RenderFrame()
     glfwMakeContextCurrent(window_);
     glfwPollEvents();
     if (glfwWindowShouldClose(window_))
+    {
+        // Qt closeEvent can cancel shutdown after an unsaved-changes prompt.
+        glfwSetWindowShouldClose(window_, GLFW_FALSE);
         return false;
+    }
 
     int window_width = 0;
     int window_height = 0;
@@ -469,13 +487,14 @@ bool SceneViewport::RenderFrame()
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplGlfw_NewFrame();
     ImGui::NewFrame();
+    ImGuizmo::BeginFrame();
     const ImGuiIO& io = ImGui::GetIO();
     const float dpi_scale = ImGui::GetStyle().FontScaleDpi;
     const ViewCube::Layout cube_layout = ViewCube::GetLayout(
         glm::vec2(io.DisplaySize.x, io.DisplaySize.y), dpi_scale);
     const bool over_cube = ViewCube::Contains(glm::vec2(io.MousePos.x, io.MousePos.y), cube_layout);
-    camera_controller_.Update(window_, io.WantCaptureMouse || over_cube || model_drag_.has_value(),
-                              io.WantCaptureKeyboard || model_drag_.has_value());
+    camera_controller_.Update(window_, io.WantCaptureMouse || over_cube || model_drag_.has_value() || ImGuizmo::IsUsingAny(),
+                              io.WantCaptureKeyboard || model_drag_.has_value() || ImGuizmo::IsUsingAny());
     if (show_demo_window_)
         ImGui::ShowDemoWindow(&show_demo_window_);
     if (show_settings_)
@@ -486,11 +505,12 @@ bool SceneViewport::RenderFrame()
     const float aspect = static_cast<float>(display_width) / display_height;
     const glm::mat4 projection = ProjectionMatrix(aspect);
     const glm::mat4 view = camera.GetViewMatrix();
+    const bool over_gizmo = DrawModelGizmo(view, projection, over_cube);
     if (pending_pick_)
     {
         const glm::vec2 position = *pending_pick_;
         pending_pick_.reset();
-        if (!io.WantCaptureMouse && !ViewCube::Contains(position, cube_layout))
+        if (!IsTransformEditing() && !io.WantCaptureMouse && !over_gizmo && !ViewCube::Contains(position, cube_layout))
         {
             const auto ray = MouseRayAt(position);
             glm::vec3 hit_point(0.0f);
@@ -514,14 +534,14 @@ bool SceneViewport::RenderFrame()
         const auto* dragged = ModelInfo(model_drag_->id);
         if (!ImGui::IsMouseDown(ImGuiMouseButton_Left) || !dragged || !dragged->selected || !dragged->visible ||
             ImGui::IsMouseDown(ImGuiMouseButton_Right) || ImGui::IsMouseDown(ImGuiMouseButton_Middle))
-            model_drag_.reset();
+            EndModelTransform();
         else
         {
             UpdateModelDrag(glm::vec2(io.MousePos.x, io.MousePos.y));
             ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
         }
     }
-    DrawAxisLabels(axis_label_font_, camera, projection * view);
+    DrawAxisLabels(axis_label_font_, camera, projection * view, *base_plate_);
     ImGui::Render();
 
     glViewport(0, 0, display_width, display_height);
@@ -564,7 +584,14 @@ bool SceneViewport::RenderFrame()
 void SceneViewport::ReleaseCursor()
 {
     camera_controller_.ReleaseCursor();
-    model_drag_.reset();
+    EndModelTransform();
+    gizmo_dragging_ = false;
+    if (imgui_context_ready_)
+    {
+        ImGuizmo::PushID("modelTransform");
+        ImGuizmo::Enable(false);
+        ImGuizmo::PopID();
+    }
     pending_pick_.reset();
 }
 
@@ -599,6 +626,11 @@ std::vector<SceneViewport::StlModelInfo> SceneViewport::ModelInfos() const
 
 void SceneViewport::ChooseActiveModel()
 {
+    if (IsTransformEditing() && FindModel(transform_editing_model_id_))
+    {
+        active_model_id_ = transform_editing_model_id_;
+        return;
+    }
     const ModelEntry* recent = nullptr;
     for (const auto& entry : models_)
         if (entry.info.selected && (!recent || entry.selection_order > recent->selection_order))
@@ -615,20 +647,44 @@ void SceneViewport::ChooseActiveModel()
 bool SceneViewport::LoadStl(const std::string& path, std::string& error,
                             glm::vec3& size_mm)
 {
+    QFile file(QString::fromUtf8(path.c_str()));
+    if (!file.open(QIODevice::ReadOnly) || file.size() <= 0 ||
+        file.size() > 512 * 1024 * 1024)
+    {
+        error = "Cannot read the STL file (supported size: 1 byte to 512 MB).";
+        return false;
+    }
+    QByteArray data = file.readAll();
+    if (file.error() != QFileDevice::NoError || data.size() != file.size())
+    {
+        error = "Failed to read the complete STL file.";
+        return false;
+    }
     glfwMakeContextCurrent(window_);
     auto loaded = std::make_unique<StlModel>();
-    if (!loaded->Load(path, error))
+    if (!loaded->LoadFromMemory(data.constData(), data.size(), error))
         return false;
+    loaded->SetPlacementCenterMm(plate_size_mm_ * 0.5f);
     size_mm = loaded->SizeMm();
     StlModelInfo info{path, size_mm, loaded->TriangleCount()};
+    info.source_file_size = static_cast<std::size_t>(data.size());
     info.id = next_model_id_++;
     ReleaseCursor();
     const bool keep_active = IsModelSelected();
-    models_.push_back({std::move(loaded), std::move(info)});
+    models_.push_back({std::move(loaded), std::move(info), 0, std::move(data)});
     if (!keep_active)
         active_model_id_ = models_.back().info.id;
     RefreshModelTransformInfo(models_.back());
     RefreshSceneBounds();
+    Operation operation;
+    operation.kind = OperationKind::Import;
+    operation.model = CaptureModel(models_.back());
+    operation.before_revision = project_revision_;
+    AdvanceProjectRevision();
+    operation.after_revision = project_revision_;
+    operation.description = QStringLiteral("打开 STL：%1")
+        .arg(QFileInfo(QString::fromUtf8(path.c_str())).fileName());
+    RecordOperation(std::move(operation));
     ++model_state_revision_;
     return true;
 }
@@ -639,8 +695,8 @@ void SceneViewport::SetModelVisible(ModelId id, bool visible)
     if (!entry || entry->info.visible == visible)
         return;
     entry->info.visible = visible;
-    if (!visible && model_drag_ && model_drag_->id == id)
-        model_drag_.reset();
+    if (!visible && pending_transform_ && pending_transform_->id == id)
+        ReleaseCursor();
     ++model_state_revision_;
 }
 
@@ -655,9 +711,12 @@ void SceneViewport::SetModelBoundingBoxVisible(ModelId id, bool visible)
 
 void SceneViewport::SetModelSelected(ModelId id, bool selected)
 {
+    if (IsTransformEditing()) return;
     auto* entry = FindModel(id);
     if (!entry)
         return;
+    if (selected && active_model_id_ != id)
+        ReleaseCursor();
     const bool changed = entry->info.selected != selected ||
                          (selected && active_model_id_ != id);
     entry->info.selected = selected;
@@ -665,12 +724,12 @@ void SceneViewport::SetModelSelected(ModelId id, bool selected)
     {
         active_model_id_ = id;
         if (changed)
-            entry->selection_order = model_state_revision_ + 1;
+            entry->selection_order = next_selection_order_++;
     }
     else
     {
-        if (model_drag_ && model_drag_->id == id)
-            model_drag_.reset();
+        if (pending_transform_ && pending_transform_->id == id)
+            ReleaseCursor();
         if (active_model_id_ == id)
             ChooseActiveModel();
     }
@@ -680,13 +739,14 @@ void SceneViewport::SetModelSelected(ModelId id, bool selected)
 
 void SceneViewport::ClearModelSelection()
 {
+    if (IsTransformEditing()) return;
     bool changed = false;
     for (auto& entry : models_)
     {
         changed |= entry.info.selected;
         entry.info.selected = false;
     }
-    model_drag_.reset();
+    ReleaseCursor();
     if (changed)
         ++model_state_revision_;
 }
@@ -742,6 +802,7 @@ SceneViewport::ModelEntry* SceneViewport::ClosestModel(
 
 bool SceneViewport::SelectModelAt(float x_pixels, float y_pixels, glm::vec3* hit_point)
 {
+    if (IsTransformEditing()) return false;
     const auto ray = MouseRayAt({x_pixels, y_pixels});
     if (!ray)
         return false;
@@ -763,14 +824,15 @@ void SceneViewport::BeginModelDrag(ModelId id, const glm::vec2& position,
     ModelDrag drag;
     drag.id = id;
     drag.anchor = hit_point;
-    drag.initial_translation_mm = glm::vec2(entry->model->Transform().translation_mm);
+    drag.initial_translation_mm = entry->model->Transform().translation_mm;
     const glm::vec3 direction = glm::normalize(ray->end - ray->start);
     // In edge-on standard views a horizontal plane is parallel to the ray.
     // Use a screen-facing plane there, and still apply only the XY component.
     if (std::abs(direction.z) < 1.0e-3f)
         drag.plane_normal = direction;
     camera_controller_.ReleaseCursor();
-    model_drag_ = drag;
+    if (BeginModelMove(id))
+        model_drag_ = drag;
 }
 
 void SceneViewport::UpdateModelDrag(const glm::vec2& position)
@@ -790,16 +852,12 @@ void SceneViewport::UpdateModelDrag(const glm::vec2& position)
     if (distance < 0.0f || !std::isfinite(distance))
         return;
     const glm::vec3 point = ray->start + direction * distance;
-    const glm::vec2 translation = drag.initial_translation_mm +
-        glm::vec2(point - drag.anchor) * BasePlate::kMmPerWorldUnit;
-    const glm::vec2 previous(entry->model->Transform().translation_mm);
-    if (!std::isfinite(translation.x) || !std::isfinite(translation.y) ||
-        glm::length(translation - previous) < 1.0e-4f)
+    const glm::vec3 world_delta = glm::vec3(glm::vec2(point - drag.anchor), 0) * BasePlate::kMmPerWorldUnit;
+    const auto rotation = glm::mat3(ModelTransformMath::Rotation(entry->info.local_rotation_degrees));
+    const glm::vec3 translation = drag.initial_translation_mm + glm::transpose(rotation) * world_delta;
+    if (glm::length(translation - entry->info.local_translation_mm) < 1.0e-4f)
         return;
-    // No plate-boundary clamp: models may be placed anywhere in the XY plane.
-    entry->model->SetTranslationXY(translation);
-    RefreshModelTransformInfo(*entry);
-    RefreshSceneBounds();
+    MoveModelTo(entry->info.id, translation);
 }
 
 void SceneViewport::RefreshModelTransformInfo(ModelEntry& entry)
@@ -812,6 +870,7 @@ void SceneViewport::RefreshModelTransformInfo(ModelEntry& entry)
     info.world_bounds_max_mm = maximum * BasePlate::kMmPerWorldUnit;
     const auto& transform = entry.model->Transform();
     info.local_translation_mm = transform.translation_mm;
+    info.placement_center_mm = entry.model->PlacementCenterMm();
     info.local_scale = transform.scale;
     info.local_rotation_degrees = transform.rotation_degrees;
     ++info.transform_revision;
@@ -835,11 +894,58 @@ void SceneViewport::RefreshSceneBounds()
 
 void SceneViewport::RemoveStl(ModelId id)
 {
+    if (!FindModel(id))
+        return;
+    ReleaseCursor();
+    auto* entry = FindModel(id);
+    Operation operation;
+    operation.kind = OperationKind::Delete;
+    operation.model = CaptureModel(*entry);
+    operation.before_revision = project_revision_;
+    operation.description = QStringLiteral("删除 STL：%1")
+        .arg(QFileInfo(QString::fromUtf8(entry->info.path.c_str())).fileName());
+    EraseModel(id);
+    AdvanceProjectRevision();
+    operation.after_revision = project_revision_;
+    RecordOperation(std::move(operation));
+}
+
+SceneViewport::SavedModel SceneViewport::CaptureModel(const ModelEntry& entry) const
+{
+    const auto index = static_cast<std::size_t>(&entry - models_.data());
+    return {entry.info, entry.stl_data, entry.selection_order, index};
+}
+
+bool SceneViewport::RestoreModel(const SavedModel& saved, QString& error)
+{
+    glfwMakeContextCurrent(window_);
+    auto model = std::make_unique<StlModel>();
+    std::string load_error;
+    if (!model->LoadFromMemory(saved.stl_data.constData(), saved.stl_data.size(), load_error))
+    {
+        error = QStringLiteral("无法恢复 STL：%1").arg(QString::fromLocal8Bit(load_error.c_str()));
+        return false;
+    }
+    model->SetPlacementCenterMm(saved.info.placement_center_mm);
+    model->SetTransform({saved.info.local_translation_mm, saved.info.local_scale,
+                         saved.info.local_rotation_degrees});
+    ModelEntry entry{std::move(model), saved.info, saved.selection_order, saved.stl_data};
+    RefreshModelTransformInfo(entry);
+    const auto index = std::min(saved.index, models_.size());
+    models_.insert(models_.begin() + index, std::move(entry));
+    ChooseActiveModel();
+    RefreshSceneBounds();
+    ++model_state_revision_;
+    return true;
+}
+
+void SceneViewport::EraseModel(ModelId id)
+{
     const auto found = std::find_if(models_.begin(), models_.end(),
         [id](const ModelEntry& entry) { return entry.info.id == id; });
     if (found == models_.end())
         return;
-    ReleaseCursor();
+    if (id == transform_editing_model_id_) EndTransformEditing();
     glfwMakeContextCurrent(window_);
     models_.erase(found);
     if (active_model_id_ == id)
@@ -848,6 +954,352 @@ void SceneViewport::RemoveStl(ModelId id)
     ++model_state_revision_;
 }
 
+void SceneViewport::AdvanceProjectRevision()
+{
+    // State identities are never reused when a new branch replaces redo steps.
+    project_revision_ = next_project_revision_++;
+}
+
+void SceneViewport::AppendHistory(const QString& description)
+{
+    operation_history_.push_back(description);
+    ++history_revision_;
+}
+
+void SceneViewport::RecordOperation(Operation operation)
+{
+    operations_.erase(operations_.begin() + operation_cursor_, operations_.end());
+    AppendHistory(operation.description);
+    operations_.push_back(std::move(operation));
+    operation_cursor_ = operations_.size();
+}
+
+void SceneViewport::ClearHistory()
+{
+    operations_.clear();
+    operation_cursor_ = 0;
+    operation_history_.clear();
+    ++history_revision_;
+}
+
+bool SceneViewport::CanUndo() const
+{
+    const auto* entry = pending_transform_ ? FindModel(pending_transform_->id) : nullptr;
+    return operation_cursor_ > 0 || (entry && entry->model->Transform() != pending_transform_->before_transform);
+}
+
+bool SceneViewport::CanRedo() const
+{
+    const auto* entry = pending_transform_ ? FindModel(pending_transform_->id) : nullptr;
+    return operation_cursor_ < operations_.size() &&
+        (!entry || entry->model->Transform() == pending_transform_->before_transform);
+}
+
+bool SceneViewport::ApplyTransform(ModelEntry& entry, const ModelTransform& transform)
+{
+    if (!ModelTransformMath::IsValid(transform)) return false;
+    const auto previous = entry.model->Transform();
+    if (previous == transform) return true;
+    entry.model->SetTransform(transform);
+    glm::vec3 minimum, maximum;
+    entry.model->GetWorldBounds(minimum, maximum);
+    for (int axis = 0; axis < 3; ++axis)
+        if (!std::isfinite(minimum[axis] * BasePlate::kMmPerWorldUnit) ||
+            !std::isfinite(maximum[axis] * BasePlate::kMmPerWorldUnit))
+        {
+            entry.model->SetTransform(previous);
+            return false;
+        }
+    RefreshModelTransformInfo(entry);
+    RefreshSceneBounds();
+    return true;
+}
+
+bool SceneViewport::BeginModelTransform(ModelId id, TransformMode mode)
+{
+    EndModelTransform();
+    const auto* entry = FindModel(id);
+    if (!entry) return false;
+    pending_transform_ = PendingTransform{id, mode, entry->model->Transform(), project_revision_};
+    return true;
+}
+
+bool SceneViewport::TransformModelTo(ModelId id, const ModelTransform& transform, TransformMode mode)
+{
+    if (pending_transform_ && (pending_transform_->id != id || pending_transform_->mode != mode))
+        EndModelTransform();
+    auto* entry = FindModel(id);
+    if (!entry) return false;
+    const auto before = entry->model->Transform();
+    const auto before_revision = project_revision_;
+    if (!ApplyTransform(*entry, transform)) return false;
+    if (before == transform) return true;
+    AdvanceProjectRevision();
+    if (!pending_transform_)
+    {
+        pending_transform_ = PendingTransform{id, mode, before, before_revision};
+        EndModelTransform();
+    }
+    return true;
+}
+
+bool SceneViewport::MoveModelTo(ModelId id, const glm::vec3& translation_mm)
+{
+    const auto* entry = FindModel(id);
+    if (!entry) return false;
+    auto transform = entry->model->Transform();
+    transform.translation_mm = translation_mm;
+    return TransformModelTo(id, transform, TransformMode::Translate);
+}
+
+void SceneViewport::EndModelTransform()
+{
+    model_drag_.reset();
+    if (!pending_transform_) return;
+    const PendingTransform pending = *pending_transform_;
+    pending_transform_.reset();
+    auto* entry = FindModel(pending.id);
+    if (!entry) return;
+    const auto after = entry->model->Transform();
+    if (ModelTransformMath::NearlyEqual(after, pending.before_transform))
+    {
+        ApplyTransform(*entry, pending.before_transform);
+        project_revision_ = pending.before_revision;
+        return;
+    }
+    Operation operation;
+    operation.kind = OperationKind::Transform;
+    operation.model.info.id = pending.id;
+    operation.before_transform = pending.before_transform;
+    operation.after_transform = after;
+    operation.before_revision = pending.before_revision;
+    operation.after_revision = project_revision_;
+    const auto format = [](const glm::vec3& value)
+    {
+        return QStringLiteral("(%1, %2, %3)").arg(value.x, 0, 'f', 3)
+            .arg(value.y, 0, 'f', 3).arg(value.z, 0, 'f', 3);
+    };
+    const QString name = QFileInfo(QString::fromUtf8(entry->info.path.c_str())).fileName();
+    if (pending.mode == TransformMode::Translate)
+        operation.description = QStringLiteral("移动 STL：%1 | 位移 %2 → %3 mm")
+            .arg(name, format(pending.before_transform.translation_mm), format(after.translation_mm));
+    else if (pending.mode == TransformMode::Rotate)
+        operation.description = QStringLiteral("旋转 STL：%1 | 角度 %2 → %3 °")
+            .arg(name, format(pending.before_transform.rotation_degrees), format(after.rotation_degrees));
+    else
+        operation.description = QStringLiteral("缩放 STL：%1 | 倍数 %2 → %3")
+            .arg(name, format(pending.before_transform.scale), format(after.scale));
+    RecordOperation(std::move(operation));
+}
+
+bool SceneViewport::BeginTransformEditing(ModelId id, TransformMode mode)
+{
+    const auto* entry = FindModel(id);
+    if (!entry || !entry->info.selected || (IsTransformEditing() && transform_editing_model_id_ != id))
+        return false;
+    SetTransformMode(mode);
+    const bool starting = !IsTransformEditing();
+    transform_editing_model_id_ = id;
+    active_model_id_ = id;
+    if (starting) ++model_state_revision_;
+    return true;
+}
+
+void SceneViewport::EndTransformEditing()
+{
+    ReleaseCursor();
+    if (!IsTransformEditing()) return;
+    transform_editing_model_id_ = 0;
+    ++model_state_revision_;
+}
+
+void SceneViewport::SetTransformMode(TransformMode mode)
+{
+    ReleaseCursor();
+    transform_mode_ = mode;
+}
+
+std::optional<glm::mat4> SceneViewport::ModelGizmoMatrix(ModelId id) const
+{
+    const auto* entry = FindModel(id);
+    if (!entry) return std::nullopt;
+    const glm::vec3 pivot(entry->info.placement_center_mm, entry->info.size_mm.z * 0.5f);
+    return ModelTransformMath::GizmoMatrix(entry->model->Transform(), pivot / BasePlate::kMmPerWorldUnit);
+}
+
+bool SceneViewport::TransformModelFromGizmo(ModelId id, const glm::mat4& matrix, TransformMode mode)
+{
+    const auto* entry = FindModel(id);
+    if (!entry) return false;
+    auto transform = entry->model->Transform();
+    const glm::vec3 pivot(entry->info.placement_center_mm, entry->info.size_mm.z * 0.5f);
+    if (!ModelTransformMath::FromGizmo(matrix, pivot / BasePlate::kMmPerWorldUnit, mode, transform))
+        return false;
+    return TransformModelTo(id, transform, mode);
+}
+
+bool SceneViewport::DrawModelGizmo(const glm::mat4& view, const glm::mat4& projection, bool over_cube)
+{
+    const auto* entry = FindModel(transform_editing_model_id_);
+    if (!entry || !entry->info.selected || !entry->info.visible || model_drag_)
+    {
+        if (gizmo_dragging_) ReleaseCursor();
+        return false;
+    }
+    const auto id = entry->info.id;
+    auto matrix = *ModelGizmoMatrix(id);
+    const auto clip = projection * view * matrix[3];
+    if (!camera_controller_.GetCamera().IsOrthographic() && clip.z < 0.001f && !gizmo_dragging_)
+        return false;
+    const ImGuiIO& io = ImGui::GetIO();
+    const auto operation = transform_mode_ == TransformMode::Translate ? ImGuizmo::TRANSLATE :
+        transform_mode_ == TransformMode::Rotate ?
+        static_cast<ImGuizmo::OPERATION>(ImGuizmo::ROTATE_X | ImGuizmo::ROTATE_Y | ImGuizmo::ROTATE_Z) : ImGuizmo::SCALE;
+    ImGuizmo::PushID("modelTransform");
+    ImGuizmo::SetRect(0, 0, io.DisplaySize.x, io.DisplaySize.y);
+    ImGuizmo::SetOrthographic(camera_controller_.GetCamera().IsOrthographic());
+    ImGuizmo::SetGizmoSizeClipSpace(0.15f);
+    ImGuizmo::Enable(!over_cube && !ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow) &&
+                    !ImGui::IsMouseDown(ImGuiMouseButton_Right) && !ImGui::IsMouseDown(ImGuiMouseButton_Middle));
+    const bool changed = ImGuizmo::Manipulate(glm::value_ptr(view), glm::value_ptr(projection),
+        operation, ImGuizmo::LOCAL, glm::value_ptr(matrix));
+    const bool using_gizmo = ImGuizmo::IsUsing();
+    if (using_gizmo && !gizmo_dragging_)
+    {
+        camera_controller_.ReleaseCursor();
+        gizmo_dragging_ = BeginModelTransform(id, transform_mode_);
+    }
+    if (changed) TransformModelFromGizmo(id, matrix, transform_mode_);
+    if (!using_gizmo && gizmo_dragging_)
+    {
+        EndModelTransform();
+        gizmo_dragging_ = false;
+    }
+    const bool over = ImGuizmo::IsOver(operation) || using_gizmo;
+    ImGuizmo::PopID();
+    return over;
+}
+
+bool SceneViewport::Undo(QString& error)
+{
+    error.clear();
+    ReleaseCursor();
+    if (!CanUndo())
+        return false;
+    auto& operation = operations_[operation_cursor_ - 1];
+    switch (operation.kind)
+    {
+    case OperationKind::Import:
+    {
+        const auto* entry = FindModel(operation.model.info.id);
+        if (!entry)
+            return false;
+        operation.model = CaptureModel(*entry);
+        EraseModel(entry->info.id);
+        break;
+    }
+    case OperationKind::Delete:
+        if (!RestoreModel(operation.model, error))
+            return false;
+        break;
+    case OperationKind::Transform:
+    {
+        auto* entry = FindModel(operation.model.info.id);
+        if (!entry || !ApplyTransform(*entry, operation.before_transform))
+            return false;
+        break;
+    }
+    case OperationKind::PlateSize:
+        ApplyPlateSizeMm(operation.before_plate_size);
+        ResetView();
+        break;
+    }
+    project_revision_ = operation.before_revision;
+    --operation_cursor_;
+    AppendHistory(QStringLiteral("撤销：%1").arg(operation.description));
+    return true;
+}
+
+bool SceneViewport::Redo(QString& error)
+{
+    error.clear();
+    ReleaseCursor();
+    if (!CanRedo())
+        return false;
+    auto& operation = operations_[operation_cursor_];
+    switch (operation.kind)
+    {
+    case OperationKind::Import:
+        if (!RestoreModel(operation.model, error))
+            return false;
+        break;
+    case OperationKind::Delete:
+    {
+        const auto* entry = FindModel(operation.model.info.id);
+        if (!entry)
+            return false;
+        operation.model = CaptureModel(*entry);
+        EraseModel(entry->info.id);
+        break;
+    }
+    case OperationKind::Transform:
+    {
+        auto* entry = FindModel(operation.model.info.id);
+        if (!entry || !ApplyTransform(*entry, operation.after_transform))
+            return false;
+        break;
+    }
+    case OperationKind::PlateSize:
+        ApplyPlateSizeMm(operation.after_plate_size);
+        ResetView();
+        break;
+    }
+    project_revision_ = operation.after_revision;
+    ++operation_cursor_;
+    AppendHistory(QStringLiteral("回撤：%1").arg(operation.description));
+    return true;
+}
+
+void SceneViewport::ApplyPlateSizeMm(const glm::vec2& size_mm)
+{
+    glfwMakeContextCurrent(window_);
+    base_plate_->SetSize(size_mm);
+    plate_size_mm_ = size_mm;
+    camera_controller_.SetPlateSizeMm(size_mm);
+    RefreshSceneBounds();
+}
+
+bool SceneViewport::SetPlateSizeMm(const glm::vec2& size_mm, QString& error)
+{
+    error.clear();
+    if (!PlateDimensions::IsValid(size_mm))
+    {
+        error = QStringLiteral("平台长度和宽度必须在 1 至 10000 mm 之间。");
+        return false;
+    }
+    if (!base_plate_ || graphics_released_)
+    {
+        error = QStringLiteral("场景尚未就绪，无法修改平台尺寸。");
+        return false;
+    }
+    ReleaseCursor();
+    if (size_mm == plate_size_mm_)
+        return true;
+    Operation operation;
+    operation.kind = OperationKind::PlateSize;
+    operation.before_plate_size = plate_size_mm_;
+    operation.after_plate_size = size_mm;
+    operation.before_revision = project_revision_;
+    operation.description = QStringLiteral("修改平台尺寸：%1 × %2 mm → %3 × %4 mm")
+        .arg(plate_size_mm_.x, 0, 'f', 2).arg(plate_size_mm_.y, 0, 'f', 2)
+        .arg(size_mm.x, 0, 'f', 2).arg(size_mm.y, 0, 'f', 2);
+    ApplyPlateSizeMm(size_mm);
+    ResetView();
+    AdvanceProjectRevision();
+    operation.after_revision = project_revision_;
+    RecordOperation(std::move(operation));
+    return true;
+}
 
 void SceneViewport::ResetView()
 {
@@ -859,12 +1311,103 @@ void SceneViewport::ResetView()
         camera_controller_.ResetView(static_cast<float>(width) / height);
 }
 
+void SceneViewport::ResetProjectDisplay()
+{
+    EndTransformEditing();
+    transform_mode_ = TransformMode::Translate;
+    camera_controller_.GetCamera() = Camera();
+    wireframe_ = false;
+    std::fill(std::begin(clear_color_), std::end(clear_color_), 1.0f);
+    ResetView();
+    // During startup the first frame refits Home to the final embedded viewport size.
+    // For an existing editor ResetView already uses its current viewport dimensions.
+}
+
+ProjectData SceneViewport::SnapshotProject() const
+{
+    ProjectData project;
+    project.plate_size_mm = plate_size_mm_;
+    project.models.reserve(models_.size());
+    for (const auto& entry : models_)
+    {
+        const auto& info = entry.info;
+        project.models.push_back({QString::fromUtf8(info.path.c_str()), entry.stl_data,
+            info.local_translation_mm, info.local_scale, info.local_rotation_degrees, info.placement_center_mm});
+    }
+    return project;
+}
+
+bool SceneViewport::ApplyProject(const ProjectData& project, QString& error)
+{
+    if (!ProjectFile::Validate(project, error))
+        return false;
+    glfwMakeContextCurrent(window_);
+    // Build the complete replacement first. A bad embedded STL keeps the old scene intact.
+    std::vector<ModelEntry> replacement;
+    replacement.reserve(project.models.size());
+    ModelId next_id = next_model_id_;
+    for (const auto& saved : project.models)
+    {
+        auto model = std::make_unique<StlModel>();
+        std::string load_error;
+        if (!model->LoadFromMemory(saved.stl_data.constData(), saved.stl_data.size(), load_error))
+        {
+            error = QStringLiteral("无法恢复模型 %1：%2")
+                .arg(QFileInfo(saved.source_path).fileName(), QString::fromLocal8Bit(load_error.c_str()));
+            return false;
+        }
+        model->SetPlacementCenterMm(saved.placement_center_mm);
+        model->SetTransform({saved.translation_mm, saved.scale, saved.rotation_degrees});
+        StlModelInfo info{saved.source_path.toUtf8().toStdString(),
+                          model->SizeMm(), model->TriangleCount()};
+        info.id = next_id++;
+        info.source_file_size = static_cast<std::size_t>(saved.stl_data.size());
+        replacement.push_back({std::move(model), std::move(info), 0, saved.stl_data});
+        RefreshModelTransformInfo(replacement.back());
+        for (int axis = 0; axis < 3; ++axis)
+            if (!std::isfinite(replacement.back().info.world_bounds_min_mm[axis]) ||
+                !std::isfinite(replacement.back().info.world_bounds_max_mm[axis]))
+            {
+                error = QStringLiteral("模型变换超出支持的坐标范围。");
+                return false;
+            }
+    }
+    ReleaseCursor();
+    pending_pick_.reset();
+    ApplyPlateSizeMm(project.plate_size_mm);
+    models_ = std::move(replacement);
+    next_model_id_ = next_id;
+    active_model_id_ = 0;
+    ChooseActiveModel();
+    RefreshSceneBounds();
+    ResetProjectDisplay();
+    ClearHistory();
+    AdvanceProjectRevision();
+    ++model_state_revision_;
+    return true;
+}
+
+void SceneViewport::NewProject()
+{
+    ReleaseCursor();
+    glfwMakeContextCurrent(window_);
+    pending_pick_.reset();
+    models_.clear();
+    ApplyPlateSizeMm(glm::vec2(PlateDimensions::kDefaultMm));
+    active_model_id_ = 0;
+    RefreshSceneBounds();
+    ResetProjectDisplay();
+    ClearHistory();
+    AdvanceProjectRevision();
+    ++model_state_revision_;
+}
+
 void SceneViewport::ReleaseGraphics()
 {
     if (graphics_released_)
         return;
     graphics_released_ = true;
-    ReleaseCursor();
+    EndTransformEditing();
     if (!window_ || !glad_ready_)
         return;
     glfwMakeContextCurrent(window_);
@@ -878,6 +1421,7 @@ void SceneViewport::ReleaseGraphics()
     axis_label_font_ = nullptr;
 
     models_.clear();
+    ClearHistory();
     active_model_id_ = 0;
     ++model_state_revision_;
     pending_pick_.reset();

@@ -12,14 +12,16 @@ if (NOT CMAKE_PREFIX_PATH AND EXISTS "D:/Qt/Qt5.14.2/5.14.2/msvc2017_64/lib/cmak
   list(PREPEND CMAKE_PREFIX_PATH "D:/Qt/Qt5.14.2/5.14.2/msvc2017_64")
 endif()
 
-find_package(QT NAMES Qt6 Qt5 REQUIRED COMPONENTS Widgets)
-find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Widgets)
+find_package(QT NAMES Qt6 Qt5 REQUIRED COMPONENTS Widgets Svg)
+find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Widgets Svg)
 qt_standard_project_setup()
+set(CMAKE_AUTORCC ON)
 
 # GLFW and Dear ImGui remain the renderer inside the Qt central widget.
 set(GLFW_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../3rd_party/glfw")
 set(IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../3rd_party/imgui")
 set(APP_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+set(IMGUIZMO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../3rd_party/ImGuizmo")
 set(GLAD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../3rd_party/glad")
 set(GLM_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../3rd_party/glm")
 set(ASSIMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../3rd_party/assimp")
@@ -45,7 +47,12 @@ else()
 endif()
 
 set(PROJECT_SOURCES
+  "${CMAKE_CURRENT_SOURCE_DIR}/../asset/icon/toolbar_icons.qrc"
+  "${IMGUIZMO_DIR}/ImGuizmo.cpp"
   "main.cpp"
+  "project_file.cpp"
+  "recent_projects.cpp"
+  "welcome_dialog.cpp"
   "scene_editor_window.cpp"
   "scene_viewport.cpp"
   "camera_controller.cpp"
@@ -65,6 +72,7 @@ qt_add_executable(glSceneEditor ${PROJECT_SOURCES})
 
 target_include_directories(glSceneEditor PRIVATE
   "${APP_SOURCE_DIR}"
+  "${IMGUIZMO_DIR}"
   "${IMGUI_DIR}"
   "${IMGUI_DIR}/backends"
   "${GLAD_DIR}/include"
@@ -83,6 +91,7 @@ target_link_libraries(glSceneEditor PRIVATE
   imm32
   assimp_prebuilt
   Qt${QT_VERSION_MAJOR}::Widgets
+  Qt${QT_VERSION_MAJOR}::Svg
 )
 
 if (WIN32)
@@ -137,4 +146,28 @@ if (WIN32)
       COMMENT "Deploying Qt runtime files"
     )
   endif()
+endif()
+
+if (BUILD_TESTING)
+  set(PROJECT_TEST_SOURCES ${PROJECT_SOURCES})
+  list(REMOVE_ITEM PROJECT_TEST_SOURCES "main.cpp")
+  add_executable(project_tests "tests/project_tests.cpp" ${PROJECT_TEST_SOURCES})
+  get_target_property(_app_include_dirs glSceneEditor INCLUDE_DIRECTORIES)
+  get_target_property(_app_link_libraries glSceneEditor LINK_LIBRARIES)
+  target_include_directories(project_tests PRIVATE ${_app_include_dirs})
+  target_link_libraries(project_tests PRIVATE ${_app_link_libraries})
+  target_compile_definitions(project_tests PRIVATE _CRT_SECURE_NO_WARNINGS
+    TEST_ASSET_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../asset")
+  if (MSVC)
+    target_compile_options(project_tests PRIVATE /utf-8)
+  endif()
+  set_target_properties(project_tests PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+  add_dependencies(project_tests glSceneEditor)
+  add_test(NAME project_roundtrip COMMAND project_tests)
+  add_test(NAME project_ui_workflow COMMAND project_tests --ui)
+  set_tests_properties(project_ui_workflow PROPERTIES TIMEOUT 45
+    ENVIRONMENT "QT_QPA_PLATFORM=windows;QT_QPA_PLATFORM_PLUGIN_PATH=${_qt_bin_dir}/../plugins")
+  set_tests_properties(project_roundtrip PROPERTIES TIMEOUT 45
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_QPA_PLATFORM_PLUGIN_PATH=${_qt_bin_dir}/../plugins")
 endif()

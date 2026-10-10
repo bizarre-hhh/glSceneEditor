@@ -16,6 +16,8 @@ compile_commands.json
 
 # Local application state
 imgui.ini
+/asset/recent_projects.json
+/glproj/*.glproj
 
 # Operating system noise
 Thumbs.db
