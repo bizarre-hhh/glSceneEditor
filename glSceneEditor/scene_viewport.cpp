@@ -1,4 +1,5 @@
 #include "scene_viewport.h"
+#include "model_names.h"
 
 #include <algorithm>
 #include <array>
@@ -32,6 +33,8 @@
 
 namespace
 {
+constexpr float kPlateContactToleranceMm = 1.0e-4f;
+
 void GlfwErrorCallback(int error, const char* description)
 {
     std::fprintf(stderr, "GLFW error %d: %s\n", error, description);
@@ -667,6 +670,9 @@ bool SceneViewport::LoadStl(const std::string& path, std::string& error,
     loaded->SetPlacementCenterMm(plate_size_mm_ * 0.5f);
     size_mm = loaded->SizeMm();
     StlModelInfo info{path, size_mm, loaded->TriangleCount()};
+    QSet<QString> names;
+    for (const auto& entry : models_) names.insert(entry.info.name.toCaseFolded());
+    info.name = ModelNames::Unique(ModelNames::FromPath(QString::fromUtf8(path.c_str())), names);
     info.source_file_size = static_cast<std::size_t>(data.size());
     info.id = next_model_id_++;
     ReleaseCursor();
@@ -683,9 +689,213 @@ bool SceneViewport::LoadStl(const std::string& path, std::string& error,
     AdvanceProjectRevision();
     operation.after_revision = project_revision_;
     operation.description = QStringLiteral("打开 STL：%1")
-        .arg(QFileInfo(QString::fromUtf8(path.c_str())).fileName());
+        .arg(models_.back().info.name);
     RecordOperation(std::move(operation));
     ++model_state_revision_;
+    return true;
+}
+
+bool SceneViewport::PlaceSelectedModelsOnPlate(QString& error)
+{
+    error.clear();
+    if (!window_ || graphics_released_ || IsTransformEditing())
+    {
+        error = QStringLiteral("请先关闭变换参数窗口，并确认场景已就绪。");
+        return false;
+    }
+    if (std::none_of(models_.begin(), models_.end(), [](const auto& entry) { return entry.info.selected; }))
+    {
+        error = QStringLiteral("请先选中需要贴合基板的模型。");
+        return false;
+    }
+    ReleaseCursor();
+    Operation operation;
+    operation.kind = OperationKind::TransformModels;
+    operation.before_revision = project_revision_;
+    for (const auto& entry : models_)
+    {
+        if (!entry.info.selected || std::abs(entry.info.world_bounds_min_mm.z) <= kPlateContactToleranceMm) continue;
+        const auto before = entry.model->Transform();
+        auto after = before;
+        // Displacement is stored along local rotated axes. Convert the world
+        // vertical move back to local coordinates so world X/Y stay fixed.
+        const glm::dmat3 rotation(ModelTransformMath::Rotation(before.rotation_degrees));
+        after.translation_mm = glm::vec3(glm::dvec3(before.translation_mm) +
+            glm::inverse(rotation) * glm::dvec3(0, 0, -entry.info.world_bounds_min_mm.z));
+        operation.transforms.push_back({entry.info.id, before, after});
+    }
+    if (operation.transforms.empty()) return true;
+    if (!ApplyTransforms(operation.transforms, true))
+    {
+        error = QStringLiteral("模型变换超出有效范围，无法贴合基板。");
+        return false;
+    }
+    AdvanceProjectRevision();
+    operation.after_revision = project_revision_;
+    operation.description = QStringLiteral("贴合基板：%1 个模型 | 最低 Z = 0 mm，X/Y 不变")
+        .arg(static_cast<qulonglong>(operation.transforms.size()));
+    RecordOperation(std::move(operation));
+    return true;
+}
+
+bool SceneViewport::DuplicateSelectedModels(QString& error)
+{
+    return RepeatSelectedModels(1, 2, {5.0f, 5.0f}, true, error);
+}
+
+bool SceneViewport::ArraySelectedModels(int rows, int columns, const glm::vec2& gap_mm,
+                                       QString& error)
+{
+    return RepeatSelectedModels(rows, columns, gap_mm, false, error);
+}
+
+bool SceneViewport::RepeatSelectedModels(int rows, int columns, const glm::vec2& gap_mm,
+                                        bool duplicate, QString& error)
+{
+    error.clear();
+    if (!window_ || graphics_released_ || IsTransformEditing())
+    {
+        error = QStringLiteral("请先关闭变换参数窗口，并确认场景已就绪。");
+        return false;
+    }
+    if (rows < 1 || rows > 100 || columns < 1 || columns > 100 ||
+        (rows == 1 && columns == 1) ||
+        !std::isfinite(gap_mm.x) || !std::isfinite(gap_mm.y) ||
+        gap_mm.x < 0 || gap_mm.y < 0 || gap_mm.x > 10000 || gap_mm.y > 10000)
+    {
+        error = QStringLiteral("行列数须为 1 至 100 且至少一项大于 1，间隙须为 0 至 10000 mm。");
+        return false;
+    }
+    std::vector<SavedModel> sources;
+    glm::vec2 minimum(FLT_MAX), maximum(-FLT_MAX);
+    for (const auto& entry : models_)
+        if (entry.info.selected)
+        {
+            sources.push_back(CaptureModel(entry));
+            minimum = glm::min(minimum, glm::vec2(entry.info.world_bounds_min_mm));
+            maximum = glm::max(maximum, glm::vec2(entry.info.world_bounds_max_mm));
+        }
+    if (sources.empty())
+    {
+        error = QStringLiteral("请先选中需要复制或阵列的模型。");
+        return false;
+    }
+    const std::size_t generated_count = sources.size() * (rows * columns - 1);
+    if (generated_count > kMaxGeneratedModels || models_.size() + generated_count > 10000)
+    {
+        error = QStringLiteral("一次最多新增 %1 个模型，工程总模型数不能超过 10000。")
+            .arg(static_cast<qulonglong>(kMaxGeneratedModels));
+        return false;
+    }
+    const glm::vec2 step = maximum - minimum + gap_mm;
+    if (!std::isfinite(step.x) || !std::isfinite(step.y))
+    {
+        error = QStringLiteral("模型范围过大，无法生成阵列。");
+        return false;
+    }
+
+    // Stage every mesh before changing the scene, selection or history.
+    glfwMakeContextCurrent(window_);
+    std::vector<ModelEntry> additions;
+    additions.reserve(generated_count);
+    ModelId next_id = next_model_id_;
+    auto next_order = next_selection_order_;
+    QSet<QString> names;
+    for (const auto& entry : models_) names.insert(entry.info.name.toCaseFolded());
+    for (int row = 0; row < rows; ++row)
+        for (int column = 0; column < columns; ++column)
+        {
+            if (row == 0 && column == 0) continue;
+            const glm::vec3 world_offset(column * step.x, row * step.y, 0.0f);
+            for (const auto& source : sources)
+            {
+                SavedModel copy = source;
+                copy.info.id = next_id++;
+                copy.info.name = ModelNames::Unique(source.info.name, names);
+                copy.info.selected = true;
+                copy.info.visible = true;
+                copy.selection_order = next_order++;
+                // Stored translation follows local rotated axes; the grid follows world X/Y.
+                const auto rotation = glm::mat3(ModelTransformMath::Rotation(copy.info.local_rotation_degrees));
+                copy.info.local_translation_mm += glm::transpose(rotation) * world_offset;
+                ModelEntry entry;
+                if (!BuildModelEntry(copy, entry, error)) return false;
+                additions.push_back(std::move(entry));
+            }
+        }
+
+    ReleaseCursor();
+    Operation operation;
+    operation.kind = OperationKind::AddModels;
+    operation.before_revision = project_revision_;
+    operation.previous_active_id = active_model_id_;
+    for (auto& entry : models_)
+        if (entry.info.selected)
+        {
+            operation.previous_selection.push_back({entry.info.id, entry.selection_order});
+            entry.info.selected = false;
+        }
+    models_.reserve(models_.size() + generated_count);
+    operation.added_models.reserve(generated_count);
+    for (auto& entry : additions)
+    {
+        models_.push_back(std::move(entry));
+        operation.added_models.push_back(CaptureModel(models_.back()));
+    }
+    next_model_id_ = next_id;
+    next_selection_order_ = next_order;
+    ChooseActiveModel();
+    RefreshSceneBounds();
+    ++model_state_revision_;
+    AdvanceProjectRevision();
+    operation.after_revision = project_revision_;
+    operation.description = duplicate
+        ? QStringLiteral("复制 STL：%1 个模型 | X 方向间隙 5.00 mm")
+              .arg(static_cast<qulonglong>(sources.size()))
+        : QStringLiteral("阵列 STL：%1 个模型 | %2 行 × %3 列 | 间隙 X %4 / Y %5 mm | 新增 %6 个")
+              .arg(static_cast<qulonglong>(sources.size())).arg(rows).arg(columns)
+              .arg(gap_mm.x, 0, 'f', 2).arg(gap_mm.y, 0, 'f', 2)
+              .arg(static_cast<qulonglong>(generated_count));
+    RecordOperation(std::move(operation));
+    return true;
+}
+
+bool SceneViewport::RenameModel(ModelId id, const QString& requested_name, QString& error)
+{
+    error.clear();
+    auto* entry = FindModel(id);
+    if (!entry)
+    {
+        error = QStringLiteral("模型已不存在，无法修改名称。");
+        return false;
+    }
+    const QString name = ModelNames::Normalize(requested_name);
+    if (!ModelNames::IsValid(name))
+    {
+        error = QStringLiteral("名称不能为空，最多 256 个字符，不能包含换行或控制字符。");
+        return false;
+    }
+    for (const auto& other : models_)
+        if (other.info.id != id && other.info.name.toCaseFolded() == name.toCaseFolded())
+        {
+            error = QStringLiteral("已有模型使用该名称，请输入不同的名称。");
+            return false;
+        }
+    if (entry->info.name == name) return true;
+
+    ReleaseCursor();
+    Operation operation;
+    operation.kind = OperationKind::Rename;
+    operation.model.info.id = id;
+    operation.before_name = entry->info.name;
+    operation.after_name = name;
+    operation.before_revision = project_revision_;
+    operation.description = QStringLiteral("修改模型名称：%1 → %2").arg(entry->info.name, name);
+    entry->info.name = name;
+    ++model_state_revision_;
+    AdvanceProjectRevision();
+    operation.after_revision = project_revision_;
+    RecordOperation(std::move(operation));
     return true;
 }
 
@@ -867,6 +1077,9 @@ void SceneViewport::RefreshModelTransformInfo(ModelEntry& entry)
     entry.model->GetWorldBounds(minimum, maximum);
     info.world_position_mm = (minimum + maximum) * (BasePlate::kMmPerWorldUnit * 0.5f);
     info.world_bounds_min_mm = minimum * BasePlate::kMmPerWorldUnit;
+    // Avoid displaying negative zero from sub-micron floating-point noise at the plate.
+    if (std::abs(info.world_bounds_min_mm.z) <= kPlateContactToleranceMm)
+        info.world_bounds_min_mm.z = 0.0f;
     info.world_bounds_max_mm = maximum * BasePlate::kMmPerWorldUnit;
     const auto& transform = entry.model->Transform();
     info.local_translation_mm = transform.translation_mm;
@@ -903,7 +1116,7 @@ void SceneViewport::RemoveStl(ModelId id)
     operation.model = CaptureModel(*entry);
     operation.before_revision = project_revision_;
     operation.description = QStringLiteral("删除 STL：%1")
-        .arg(QFileInfo(QString::fromUtf8(entry->info.path.c_str())).fileName());
+        .arg(entry->info.name);
     EraseModel(id);
     AdvanceProjectRevision();
     operation.after_revision = project_revision_;
@@ -918,6 +1131,11 @@ SceneViewport::SavedModel SceneViewport::CaptureModel(const ModelEntry& entry) c
 
 bool SceneViewport::RestoreModel(const SavedModel& saved, QString& error)
 {
+    return RestoreModels({saved}, error);
+}
+
+bool SceneViewport::BuildModelEntry(const SavedModel& saved, ModelEntry& entry, QString& error)
+{
     glfwMakeContextCurrent(window_);
     auto model = std::make_unique<StlModel>();
     std::string load_error;
@@ -929,14 +1147,49 @@ bool SceneViewport::RestoreModel(const SavedModel& saved, QString& error)
     model->SetPlacementCenterMm(saved.info.placement_center_mm);
     model->SetTransform({saved.info.local_translation_mm, saved.info.local_scale,
                          saved.info.local_rotation_degrees});
-    ModelEntry entry{std::move(model), saved.info, saved.selection_order, saved.stl_data};
+    entry = {std::move(model), saved.info, saved.selection_order, saved.stl_data};
     RefreshModelTransformInfo(entry);
-    const auto index = std::min(saved.index, models_.size());
-    models_.insert(models_.begin() + index, std::move(entry));
+    for (int axis = 0; axis < 3; ++axis)
+        if (!std::isfinite(entry.info.world_bounds_min_mm[axis]) ||
+            !std::isfinite(entry.info.world_bounds_max_mm[axis]))
+        {
+            error = QStringLiteral("模型变换超出有效范围，无法生成副本。");
+            return false;
+        }
+    return true;
+}
+
+bool SceneViewport::RestoreModels(const std::vector<SavedModel>& saved, QString& error)
+{
+    std::vector<ModelEntry> restored;
+    restored.reserve(saved.size());
+    for (const auto& model : saved)
+    {
+        ModelEntry entry;
+        if (!BuildModelEntry(model, entry, error)) return false;
+        restored.push_back(std::move(entry));
+    }
+    models_.reserve(models_.size() + saved.size());
+    for (std::size_t i = 0; i < saved.size(); ++i)
+        models_.insert(models_.begin() + std::min(saved[i].index, models_.size()), std::move(restored[i]));
     ChooseActiveModel();
     RefreshSceneBounds();
     ++model_state_revision_;
     return true;
+}
+
+void SceneViewport::RestoreSelection(const std::vector<SavedSelection>& selection, ModelId active_id)
+{
+    for (auto& entry : models_) entry.info.selected = false;
+    for (const auto& saved : selection)
+        if (auto* entry = FindModel(saved.id))
+        {
+            entry->info.selected = true;
+            entry->selection_order = saved.order;
+        }
+    active_model_id_ = active_id;
+    ChooseActiveModel();
+    ++model_state_revision_;
 }
 
 void SceneViewport::EraseModel(ModelId id)
@@ -1015,6 +1268,28 @@ bool SceneViewport::ApplyTransform(ModelEntry& entry, const ModelTransform& tran
     return true;
 }
 
+bool SceneViewport::ApplyTransforms(const std::vector<ModelTransformChange>& changes, bool forward)
+{
+    for (const auto& change : changes)
+        if (!FindModel(change.id) || !ModelTransformMath::IsValid(forward ? change.after : change.before))
+            return false;
+    std::vector<ModelTransform> previous;
+    previous.reserve(changes.size());
+    for (std::size_t i = 0; i < changes.size(); ++i)
+    {
+        auto* entry = FindModel(changes[i].id);
+        previous.push_back(entry->model->Transform());
+        if (!ApplyTransform(*entry, forward ? changes[i].after : changes[i].before))
+        {
+            // A rejected member must not leave the rest of the selection moved.
+            for (std::size_t restored = 0; restored < i; ++restored)
+                ApplyTransform(*FindModel(changes[restored].id), previous[restored]);
+            return false;
+        }
+    }
+    return true;
+}
+
 bool SceneViewport::BeginModelTransform(ModelId id, TransformMode mode)
 {
     EndModelTransform();
@@ -1079,7 +1354,7 @@ void SceneViewport::EndModelTransform()
         return QStringLiteral("(%1, %2, %3)").arg(value.x, 0, 'f', 3)
             .arg(value.y, 0, 'f', 3).arg(value.z, 0, 'f', 3);
     };
-    const QString name = QFileInfo(QString::fromUtf8(entry->info.path.c_str())).fileName();
+    const QString name = entry->info.name;
     if (pending.mode == TransformMode::Translate)
         operation.description = QStringLiteral("移动 STL：%1 | 位移 %2 → %3 mm")
             .arg(name, format(pending.before_transform.translation_mm), format(after.translation_mm));
@@ -1189,6 +1464,28 @@ bool SceneViewport::Undo(QString& error)
     auto& operation = operations_[operation_cursor_ - 1];
     switch (operation.kind)
     {
+    case OperationKind::Rename:
+    {
+        auto* entry = FindModel(operation.model.info.id);
+        if (!entry) return false;
+        entry->info.name = operation.before_name;
+        ++model_state_revision_;
+        break;
+    }
+    case OperationKind::TransformModels:
+        if (!ApplyTransforms(operation.transforms, false)) return false;
+        break;
+    case OperationKind::AddModels:
+    {
+        for (const auto& saved : operation.added_models)
+            if (!FindModel(saved.info.id)) return false;
+        for (auto& saved : operation.added_models)
+            saved = CaptureModel(*FindModel(saved.info.id));
+        for (auto it = operation.added_models.rbegin(); it != operation.added_models.rend(); ++it)
+            EraseModel(it->info.id);
+        RestoreSelection(operation.previous_selection, operation.previous_active_id);
+        break;
+    }
     case OperationKind::Import:
     {
         const auto* entry = FindModel(operation.model.info.id);
@@ -1229,6 +1526,24 @@ bool SceneViewport::Redo(QString& error)
     auto& operation = operations_[operation_cursor_];
     switch (operation.kind)
     {
+    case OperationKind::Rename:
+    {
+        auto* entry = FindModel(operation.model.info.id);
+        if (!entry) return false;
+        entry->info.name = operation.after_name;
+        ++model_state_revision_;
+        break;
+    }
+    case OperationKind::TransformModels:
+        if (!ApplyTransforms(operation.transforms, true)) return false;
+        break;
+    case OperationKind::AddModels:
+        if (!RestoreModels(operation.added_models, error)) return false;
+        for (const auto& selected : operation.previous_selection)
+            if (auto* entry = FindModel(selected.id)) entry->info.selected = false;
+        ChooseActiveModel();
+        ++model_state_revision_;
+        break;
     case OperationKind::Import:
         if (!RestoreModel(operation.model, error))
             return false;
@@ -1332,7 +1647,7 @@ ProjectData SceneViewport::SnapshotProject() const
     {
         const auto& info = entry.info;
         project.models.push_back({QString::fromUtf8(info.path.c_str()), entry.stl_data,
-            info.local_translation_mm, info.local_scale, info.local_rotation_degrees, info.placement_center_mm});
+            info.local_translation_mm, info.local_scale, info.local_rotation_degrees, info.placement_center_mm, info.name});
     }
     return project;
 }
@@ -1346,6 +1661,9 @@ bool SceneViewport::ApplyProject(const ProjectData& project, QString& error)
     std::vector<ModelEntry> replacement;
     replacement.reserve(project.models.size());
     ModelId next_id = next_model_id_;
+    QSet<QString> names;
+    for (const auto& saved : project.models)
+        if (!saved.name.isEmpty()) names.insert(saved.name.toCaseFolded());
     for (const auto& saved : project.models)
     {
         auto model = std::make_unique<StlModel>();
@@ -1361,6 +1679,8 @@ bool SceneViewport::ApplyProject(const ProjectData& project, QString& error)
         StlModelInfo info{saved.source_path.toUtf8().toStdString(),
                           model->SizeMm(), model->TriangleCount()};
         info.id = next_id++;
+        info.name = saved.name.isEmpty()
+            ? ModelNames::Unique(ModelNames::FromPath(saved.source_path), names) : saved.name;
         info.source_file_size = static_cast<std::size_t>(saved.stl_data.size());
         replacement.push_back({std::move(model), std::move(info), 0, saved.stl_data});
         RefreshModelTransformInfo(replacement.back());

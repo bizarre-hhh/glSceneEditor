@@ -36,6 +36,7 @@ public:
 
 protected:
     void closeEvent(QCloseEvent* event) override;
+    bool eventFilter(QObject* object, QEvent* event) override;
 
 private:
     void NewProject();
@@ -49,6 +50,10 @@ private:
     void ShowOperationHistory();
     void UpdateOperationHistory();
     void OpenStl();
+    void RenameModel(std::uint64_t id);
+    void DuplicateModels();
+    void ArrayModels();
+    void PlaceModelsOnPlate();
     void EditPlateSize();
     void EditModelTransform(TransformMode mode);
     void ApplyModelTransformDialog();
@@ -66,6 +71,9 @@ private:
     std::uint64_t saved_history_revision_ = 0;
     QAction* undo_action_ = nullptr;
     QAction* redo_action_ = nullptr;
+    QAction* duplicate_action_ = nullptr;
+    QAction* array_action_ = nullptr;
+    QAction* place_on_plate_action_ = nullptr;
     QDialog* transform_dialog_ = nullptr;
     std::array<QDoubleSpinBox*, 3> transform_fields_{};
     std::uint64_t transform_dialog_model_id_ = 0;

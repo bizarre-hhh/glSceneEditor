@@ -11,6 +11,9 @@
     <file>house.svg</file>
     <file>settings.svg</file>
     <file>ruler.svg</file>
+    <file>duplicate-model.svg</file>
+    <file>model-array.svg</file>
+    <file>drop-to-plate.svg</file>
     <file>LICENSE-Lucide.txt</file>
   </qresource>
 </RCC>

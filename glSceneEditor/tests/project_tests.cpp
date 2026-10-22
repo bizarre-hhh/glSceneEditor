@@ -10,6 +10,8 @@
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QLabel>
+#include <QLineEdit>
+#include <QSet>
 #include <QKeyEvent>
 #include <QImage>
 #include <QDockWidget>
@@ -20,6 +22,7 @@
 #include <QToolButton>
 #include <QMessageBox>
 #include <QPushButton>
+#include <QSpinBox>
 #include <QTemporaryDir>
 #include <QTimer>
 #include <QWidget>
@@ -68,7 +71,7 @@ bool SameModel(const ProjectModel& a, const ProjectModel& b)
 {
     return a.source_path == b.source_path && a.stl_data == b.stl_data &&
         a.translation_mm == b.translation_mm && a.scale == b.scale &&
-        a.rotation_degrees == b.rotation_degrees && a.placement_center_mm == b.placement_center_mm;
+        a.rotation_degrees == b.rotation_degrees && a.placement_center_mm == b.placement_center_mm && a.name == b.name;
 }
 
 bool SameProject(const ProjectData& a, const ProjectData& b)
@@ -97,6 +100,8 @@ QByteArray LegacyProject(const ProjectData& project, quint32 version = 1)
             stream << value;
         stream << quint8(1) << quint8(1);
     }
+    if (version >= 3)
+        stream << project.plate_size_mm.x << project.plate_size_mm.y;
     stream << quint32(project.models.size());
     for (const auto& model : project.models)
     {
@@ -107,6 +112,8 @@ QByteArray LegacyProject(const ProjectData& project, quint32 version = 1)
         }
         for (const auto& vector : {model.translation_mm, model.scale, model.rotation_degrees})
             stream << vector.x << vector.y << vector.z;
+        if (version >= 3)
+            stream << model.placement_center_mm.x << model.placement_center_mm.y;
         if (version == 1)
             stream << quint8(0) << quint8(1) << quint8(1) << quint64(99);
     }
@@ -222,12 +229,14 @@ void FileTests(const QString& directory)
     ProjectModel first;
     first.source_path = QStringLiteral("D:/已删除的文件夹/模型.stl");
     first.stl_data = stl;
+    first.name = QStringLiteral("模型");
     first.translation_mm = {-123.4567f, 78.125f, 9.25f};
     first.scale = {1.2f, 0.8f, 2.0f};
     first.rotation_degrees = {13.25f, -35.75f, 82.5f};
     original.models.push_back(first);
     ProjectModel duplicate = first;
     duplicate.translation_mm = {13.5f, 72.5f, -9.5f};
+    duplicate.name = QStringLiteral("模型 (2)");
     original.models.push_back(duplicate);
     Run("single-file roundtrip: duplicates, UTF-8 paths and transforms", [&]()
     {
@@ -237,13 +246,25 @@ void FileTests(const QString& directory)
         Require(SameProject(original, restored), "saved document differs");
         Require(restored.models[0].stl_data == stl, "embedded STL changed");
     });
-    Run("version 3 adds platform dimensions and model placement without presentation fields", [&]()
+    Run("version 4 adds independent UTF-8 names without presentation fields", [&]()
     {
         const QByteArray bytes = ReadBytes(file);
-        const QByteArray version2 = LegacyProject(original, 2);
-        Require(static_cast<unsigned char>(bytes[4]) == 3, "new format version missing");
-        Require(bytes.size() - version2.size() == 8 + 8 * int(original.models.size()),
-                "unexpected presentation fields serialized");
+        const QByteArray version3 = LegacyProject(original, 3);
+        int name_bytes = 0;
+        for (const auto& model : original.models) name_bytes += 4 + model.name.toUtf8().size();
+        Require(static_cast<unsigned char>(bytes[4]) == 4, "new format version missing");
+        Require(bytes.size() - version3.size() == name_bytes, "unexpected serialized fields");
+    });
+    Run("version 3 preserves placement and derives distinct names for repeated paths", [&]()
+    {
+        ProjectData sized = original;
+        sized.plate_size_mm = {225, 175};
+        sized.models[1].placement_center_mm = {112.5f, 87.5f};
+        const QString path = directory + "/version3.glproj";
+        WriteBytes(path, LegacyProject(sized, 3));
+        ProjectData restored;
+        Require(ProjectFile::Read(path, restored, error), qPrintable(error));
+        Require(SameProject(sized, restored), "version 3 lost geometry or name migration");
     });
     Run("version 2 compatibility defaults platform to 100 mm and preserves model positions", [&]()
     {
@@ -291,7 +312,7 @@ void FileTests(const QString& directory)
             Require(SameProject(previous, original), "failed read replaced document");
         }
         QByteArray invalid = bytes;
-        invalid[4] = 4; // Unsupported format version.
+        invalid[4] = 5; // Unsupported format version.
         WriteBytes(directory + "/bad.glproj", invalid);
         ProjectData previous = original;
         Require(!ProjectFile::Read(directory + "/bad.glproj", previous, error), "newer version accepted");
@@ -716,6 +737,399 @@ void TransformTests(const QString& directory)
         Require(!ImGuizmo::IsUsingAny() && ImGuizmo::GetHoveredHandleType() == ImGuizmo::MT_NONE,
                 "gizmo was usable after parameter session closed");
         frame({-100, -100}, false);
+    });
+}
+
+void PlatePlacementTests(const QString& directory)
+{
+    SceneViewport viewport;
+    Require(viewport.Initialize(), "initialize plate placement viewport");
+    QString error;
+    const auto load = [&](const char* name)
+    {
+        std::string load_error;
+        glm::vec3 size;
+        const QString path = QStringLiteral(TEST_ASSET_DIR) + '/' + QString::fromLatin1(name);
+        Require(viewport.LoadStl(path.toUtf8().toStdString(), load_error, size), load_error.c_str());
+        return viewport.ModelInfos().back().id;
+    };
+    Run("place selected models on plate independently with world XY and pose preserved", [&]()
+    {
+        viewport.NewProject();
+        const auto cone = load("cone_30mm.stl");
+        const auto cube = load("cube_30mm.stl");
+        const auto torus = load("torus_30mm.stl");
+        const auto untouched = load("sphere_30mm.stl");
+        Require(viewport.TransformModelTo(cone, {{0, 0, 0}, {1, 1, 1}, {0, 135, 0}}, TransformMode::Rotate), "tilt asymmetric cone");
+        const float expected_tip_z = 15.0f * (1.0f + std::cos(glm::radians(135.0f)));
+        Require(std::abs(viewport.ModelInfo(cone)->world_bounds_min_mm.z - expected_tip_z) < 0.001f,
+                "rotated bounds use empty box corners instead of actual cone tip");
+        Require(viewport.TransformModelTo(cube, {{12, -8, 45}, {2, 0.5f, 1.25f}, {20, 30, 60}}, TransformMode::Rotate), "place cube above plate");
+        Require(viewport.TransformModelTo(torus, {{-20, 10, -55}, {0.8f, 1.3f, 1.5f}, {35, -40, 15}}, TransformMode::Rotate), "place torus below plate");
+        for (const auto id : {cone, cube, torus}) viewport.SetModelSelected(id, true);
+        viewport.SetModelVisible(torus, false);
+        viewport.SetModelBoundingBoxVisible(cube, true);
+        const auto before = viewport.SnapshotProject();
+        const auto infos = viewport.ModelInfos();
+        const auto history = viewport.HistoryRevision();
+        const auto revision = viewport.ProjectRevision();
+        const Camera camera = viewport.GetCamera();
+        Require(viewport.PlaceSelectedModelsOnPlate(error), qPrintable(error));
+        const auto grounded = viewport.ModelInfos();
+        for (std::size_t i = 0; i < 3; ++i)
+        {
+            Require(grounded[i].world_bounds_min_mm.z == 0 &&
+                    glm::length(glm::vec2(grounded[i].world_bounds_min_mm - infos[i].world_bounds_min_mm)) < 0.001f &&
+                    glm::length(glm::vec2(grounded[i].world_bounds_max_mm - infos[i].world_bounds_max_mm)) < 0.001f &&
+                    glm::length(glm::vec2(grounded[i].world_position_mm - infos[i].world_position_mm)) < 0.001f,
+                    "plate placement did not zero minimum Z or changed world XY");
+            Require(grounded[i].local_scale == infos[i].local_scale &&
+                    grounded[i].local_rotation_degrees == infos[i].local_rotation_degrees &&
+                    grounded[i].selected == infos[i].selected && grounded[i].visible == infos[i].visible &&
+                    grounded[i].bounding_box_visible == infos[i].bounding_box_visible, "plate placement changed pose/presentation");
+        }
+        // The cone's real tip is its lowest vertex at this angle; it must touch the plate.
+        const glm::vec3 tip = glm::vec3(*viewport.ModelGizmoMatrix(cone) * glm::vec4(0, 0, 1.5f, 1)) * 10.0f;
+        Require(std::abs(tip.z) < 0.001f, "real cone tip still floats above the plate");
+        Require(SameModel(before.models[3], viewport.SnapshotProject().models[3]) &&
+                viewport.ModelInfo(untouched)->world_position_mm == infos[3].world_position_mm, "unselected model moved");
+        Require(viewport.HistoryRevision() == history + 1 && viewport.OperationHistory().back().startsWith(QStringLiteral("贴合基板")) &&
+                viewport.CurrentModelInfo()->id == torus, "placement not one history step or changed active selection");
+        Require(viewport.GetCamera().Target() == camera.Target() && viewport.GetCamera().Distance() == camera.Distance(), "placement moved camera");
+        const auto expected = viewport.SnapshotProject();
+        Require(viewport.Undo(error) && SameProject(before, viewport.SnapshotProject()) && viewport.ProjectRevision() == revision,
+                "batch placement undo did not restore original poses");
+        Require(viewport.Redo(error) && SameProject(expected, viewport.SnapshotProject()), "batch placement redo not exact");
+        const auto settled_history = viewport.HistoryRevision();
+        Require(viewport.PlaceSelectedModelsOnPlate(error) && viewport.HistoryRevision() == settled_history,
+                "already grounded models added history");
+        const QString project_path = directory + QStringLiteral("/贴合基板.glproj");
+        ProjectData project;
+        Require(ProjectFile::Write(project_path, expected, error) && ProjectFile::Read(project_path, project, error) &&
+                viewport.ApplyProject(project, error) && SameProject(expected, viewport.SnapshotProject()), "grounded project roundtrip");
+        for (std::size_t i = 0; i < 3; ++i)
+            Require(viewport.ModelInfos()[i].world_bounds_min_mm.z == 0, "reopened model no longer on plate");
+    });
+    Run("empty or locked selection and already grounded no-op preserve history and redo", [&]()
+    {
+        viewport.NewProject();
+        const auto id = load("cube_30mm.stl");
+        const auto history = viewport.HistoryRevision();
+        Require(!viewport.PlaceSelectedModelsOnPlate(error) && !error.isEmpty() && viewport.HistoryRevision() == history,
+                "empty placement changed history");
+        viewport.SetModelSelected(id, true);
+        Require(viewport.PlaceSelectedModelsOnPlate(error) && viewport.HistoryRevision() == history, "grounded import moved");
+        Require(viewport.MoveModelTo(id, {10, -5, 20}) && viewport.Undo(error), "prepare redo for placement no-op");
+        const auto undo_history = viewport.HistoryRevision();
+        Require(viewport.PlaceSelectedModelsOnPlate(error) && viewport.CanRedo() && viewport.HistoryRevision() == undo_history,
+                "placement no-op cleared redo");
+        Require(viewport.BeginTransformEditing(id, TransformMode::Translate), "begin locked placement fixture");
+        Require(!viewport.PlaceSelectedModelsOnPlate(error) && viewport.HistoryRevision() == undo_history, "placement changed locked model");
+        viewport.EndTransformEditing();
+    });
+    Run("array copies can be grounded and the whole placement undone separately", [&]()
+    {
+        viewport.NewProject();
+        const auto id = load("cube_30mm.stl");
+        Require(viewport.MoveModelTo(id, {4, 8, 30}), "raise array source");
+        viewport.SetModelSelected(id, true);
+        Require(viewport.ArraySelectedModels(2, 2, {5, 5}, error), qPrintable(error));
+        const auto elevated = viewport.SnapshotProject();
+        Require(viewport.PlaceSelectedModelsOnPlate(error), qPrintable(error));
+        const auto infos = viewport.ModelInfos();
+        Require(infos[0].world_bounds_min_mm.z == 30, "grounding copies moved unselected original");
+        for (std::size_t i = 1; i < infos.size(); ++i) Require(infos[i].world_bounds_min_mm.z == 0, "array copy not grounded");
+        Require(viewport.Undo(error) && SameProject(elevated, viewport.SnapshotProject()), "placement undo also removed array");
+        Require(viewport.Undo(error) && viewport.ModelCount() == 1, "array undo after placement failed");
+        Require(viewport.Redo(error) && viewport.Redo(error) && viewport.ModelInfos().back().world_bounds_min_mm.z == 0,
+                "array and placement redo sequence failed");
+    });
+}
+
+void DuplicationTests(const QString& directory)
+{
+    SceneViewport viewport;
+    Require(viewport.Initialize(), "initialize duplication viewport");
+    QString error;
+    const auto load = [&](const QString& source)
+    {
+        std::string load_error;
+        glm::vec3 size;
+        Require(viewport.LoadStl(source.toUtf8().toStdString(), load_error, size), load_error.c_str());
+        return viewport.ModelInfos().back().id;
+    };
+    Run("duplicate preserves pose, offsets along world X and restores selection in one undo", [&]()
+    {
+        viewport.NewProject();
+        const auto id = load(QStringLiteral(TEST_ASSET_DIR "/cube_30mm.stl"));
+        Require(viewport.TransformModelTo(id, {{12, -8, 4}, {2, 0.5f, 1.25f}, {0, 0, 90}}, TransformMode::Rotate), "prepare rotated duplicate");
+        viewport.SetModelSelected(id, true);
+        viewport.SetModelVisible(id, false);
+        viewport.SetModelBoundingBoxVisible(id, true);
+        const auto source = *viewport.ModelInfo(id);
+        const auto before = viewport.SnapshotProject();
+        const auto revision = viewport.ProjectRevision();
+        const auto history = viewport.HistoryRevision();
+        const auto camera = viewport.GetCamera();
+        Require(viewport.DuplicateSelectedModels(error), qPrintable(error));
+        const auto infos = viewport.ModelInfos();
+        Require(infos.size() == 2 && infos[1].id != id && !infos[0].selected && infos[1].selected &&
+                infos[1].visible && infos[1].bounding_box_visible, "duplicate identity/selection/presentation");
+        const auto& copy = infos[1];
+        const glm::vec3 expected(source.world_bounds_max_mm.x - source.world_bounds_min_mm.x + 5, 0, 0);
+        Require(glm::length(copy.world_position_mm - source.world_position_mm - expected) < 0.001f &&
+                copy.local_rotation_degrees == source.local_rotation_degrees && copy.local_scale == source.local_scale,
+                "duplicate changed pose or used local instead of world X");
+        Require(viewport.HistoryRevision() == history + 1 && SameCamera(camera, viewport.GetCamera()), "duplicate history/camera");
+        const auto duplicated = viewport.SnapshotProject();
+        Require(viewport.Undo(error) && SameProject(before, viewport.SnapshotProject()) &&
+                viewport.ProjectRevision() == revision && viewport.ModelInfo(id)->selected &&
+                viewport.CurrentModelInfo()->id == id, "duplicate undo did not restore source selection/geometry");
+        Require(viewport.Redo(error) && SameProject(duplicated, viewport.SnapshotProject()) &&
+                viewport.ModelInfos()[1].id == copy.id && !viewport.ModelInfo(id)->selected,
+                "duplicate redo did not preserve model identity");
+        Require(viewport.MoveModelTo(id, {100, 100, 4}), "move original after duplication");
+        Require(viewport.ModelInfo(copy.id)->world_position_mm == copy.world_position_mm, "copy shares editable transform with original");
+    });
+    Run("multi-model array repeats the group in world XY and preserves unselected models", [&]()
+    {
+        viewport.NewProject();
+        const auto first = load(QStringLiteral(TEST_ASSET_DIR "/cube_30mm.stl"));
+        const auto second = load(QStringLiteral(TEST_ASSET_DIR "/torus_30mm.stl"));
+        load(QStringLiteral(TEST_ASSET_DIR "/sphere_30mm.stl"));
+        Require(viewport.TransformModelTo(first, {{-20, 8, 5}, {1.2f, 0.7f, 1.1f}, {15, 25, 90}}, TransformMode::Rotate), "prepare first array object");
+        Require(viewport.TransformModelTo(second, {{25, -10, 3}, {0.5f, 1.5f, 0.8f}, {0, 20, -30}}, TransformMode::Rotate), "prepare second array object");
+        viewport.SetModelSelected(first, true);
+        viewport.SetModelSelected(second, true);
+        const auto sources = viewport.ModelInfos();
+        const auto before = viewport.SnapshotProject();
+        const auto history = viewport.HistoryRevision();
+        const glm::vec2 minimum = glm::min(glm::vec2(sources[0].world_bounds_min_mm), glm::vec2(sources[1].world_bounds_min_mm));
+        const glm::vec2 maximum = glm::max(glm::vec2(sources[0].world_bounds_max_mm), glm::vec2(sources[1].world_bounds_max_mm));
+        const glm::vec2 step = maximum - minimum + glm::vec2(7.5f, 12.25f);
+        Require(viewport.ArraySelectedModels(2, 3, {7.5f, 12.25f}, error), qPrintable(error));
+        const auto copies = viewport.ModelInfos();
+        Require(copies.size() == 13 && viewport.HistoryRevision() == history + 1, "array count or batch history wrong");
+        const auto after = viewport.SnapshotProject();
+        for (int i = 0; i < 3; ++i) Require(SameModel(before.models[i], after.models[i]), "array moved an original");
+        std::size_t index = 3;
+        for (int row = 0; row < 2; ++row)
+            for (int column = 0; column < 3; ++column)
+            {
+                if (row == 0 && column == 0) continue;
+                for (int source = 0; source < 2; ++source, ++index)
+                {
+                    const auto& copy = copies[index];
+                    const glm::vec3 offset(column * step.x, row * step.y, 0);
+                    Require(glm::length(copy.world_position_mm - sources[source].world_position_mm - offset) < 0.002f &&
+                            copy.local_scale == sources[source].local_scale &&
+                            copy.local_rotation_degrees == sources[source].local_rotation_degrees && copy.selected,
+                            "array lost group spacing, orientation, Z or selection");
+                }
+            }
+        Require(!copies[2].selected && copies[2].world_position_mm == sources[2].world_position_mm, "unselected model affected");
+        Require(viewport.Undo(error) && SameProject(before, viewport.SnapshotProject()) &&
+                viewport.ModelInfo(first)->selected && viewport.CurrentModelInfo()->id == second,
+                "array not undone as one step with original active selection");
+        Require(viewport.Redo(error) && SameProject(after, viewport.SnapshotProject()), "array redo changed data");
+        for (std::size_t i = 3; i < copies.size(); ++i)
+            Require(viewport.ModelInfos()[i].id == copies[i].id, "array redo changed IDs");
+    });
+    Run("array uses embedded STL after source deletion and survives project roundtrip", [&]()
+    {
+        viewport.NewProject();
+        const QString source = directory + QStringLiteral("/阵列源模型.stl");
+        WriteBytes(source, ReadBytes(QStringLiteral(TEST_ASSET_DIR "/cube_30mm.stl")));
+        const auto id = load(source);
+        viewport.SetModelSelected(id, true);
+        Require(QFile::remove(source), "remove array source");
+        Require(viewport.ArraySelectedModels(3, 1, {0, 0}, error), qPrintable(error));
+        const auto expected = viewport.SnapshotProject();
+        Require(viewport.Undo(error) && viewport.Redo(error), "array redo depends on source file");
+        const QString project_path = directory + QStringLiteral("/阵列工程.glproj");
+        ProjectData project;
+        Require(ProjectFile::Write(project_path, expected, error) && ProjectFile::Read(project_path, project, error) &&
+                viewport.ApplyProject(project, error) && SameProject(expected, viewport.SnapshotProject()),
+                "array project did not roundtrip independently of source");
+    });
+    Run("invalid and excessive arrays do not alter models, history or selection", [&]()
+    {
+        viewport.NewProject();
+        Require(!viewport.DuplicateSelectedModels(error) && !error.isEmpty(), "empty selection duplicated");
+        const auto id = load(QStringLiteral(TEST_ASSET_DIR "/cube_30mm.stl"));
+        viewport.SetModelSelected(id, true);
+        const auto before = viewport.SnapshotProject();
+        const auto history = viewport.HistoryRevision();
+        const auto revision = viewport.ProjectRevision();
+        Require(!viewport.ArraySelectedModels(1, 1, {5, 5}, error), "1x1 accepted");
+        Require(!viewport.ArraySelectedModels(0, 2, {5, 5}, error), "zero rows accepted");
+        Require(!viewport.ArraySelectedModels(2, std::numeric_limits<int>::max(), {5, 5}, error), "row overflow accepted");
+        Require(!viewport.ArraySelectedModels(2, 2, {-1, 5}, error), "negative gap accepted");
+        Require(!viewport.ArraySelectedModels(2, 2, {std::numeric_limits<float>::infinity(), 5}, error), "nonfinite gap accepted");
+        Require(!viewport.ArraySelectedModels(100, 100, {5, 5}, error), "excessive array accepted");
+        Require(viewport.BeginTransformEditing(id, TransformMode::Translate), "begin transform editing");
+        Require(!viewport.DuplicateSelectedModels(error), "duplicated while selection locked");
+        viewport.EndTransformEditing();
+        Require(SameProject(before, viewport.SnapshotProject()) && viewport.HistoryRevision() == history &&
+                viewport.ProjectRevision() == revision && viewport.ModelInfo(id)->selected,
+                "rejected arrays modified state");
+    });
+    Run("new duplicate after undo replaces the redo branch with fresh identities", [&]()
+    {
+        viewport.NewProject();
+        const auto id = load(QStringLiteral(TEST_ASSET_DIR "/cube_30mm.stl"));
+        viewport.SetModelSelected(id, true);
+        Require(viewport.DuplicateSelectedModels(error), qPrintable(error));
+        const auto previous_id = viewport.ModelInfos().back().id;
+        Require(viewport.Undo(error) && viewport.CanRedo(), "prepare duplicate branch");
+        Require(viewport.ArraySelectedModels(2, 1, {5, 8}, error), qPrintable(error));
+        Require(!viewport.CanRedo() && viewport.ModelInfos().back().id != previous_id, "redo branch or model ID reused");
+    });
+    Run("array placement overflow rolls back all staged copies", [&]()
+    {
+        viewport.NewProject();
+        const auto id = load(QStringLiteral(TEST_ASSET_DIR "/cube_30mm.stl"));
+        Require(viewport.TransformModelTo(id, {{0, 0, 0}, {1.0e36f, 1, 1}, {0, 0, 0}}, TransformMode::Scale), "prepare very large model");
+        viewport.SetModelSelected(id, true);
+        const auto before = viewport.SnapshotProject();
+        const auto history = viewport.HistoryRevision();
+        Require(!viewport.ArraySelectedModels(1, 20, {0, 0}, error) && !error.isEmpty(), "overflowed array accepted");
+        Require(SameProject(before, viewport.SnapshotProject()) && viewport.HistoryRevision() == history &&
+                viewport.ModelInfo(id)->selected, "staging failure left partial copies");
+    });
+}
+
+void NamingTests(const QString& directory)
+{
+    SceneViewport viewport;
+    Require(viewport.Initialize(), "initialize naming viewport");
+    QString error;
+    auto load = [&](const QString& path)
+    {
+        std::string load_error;
+        glm::vec3 size;
+        Require(viewport.LoadStl(path.toUtf8().toStdString(), load_error, size), load_error.c_str());
+        return viewport.ModelInfos().back().id;
+    };
+    auto unique_names = [&]()
+    {
+        QSet<QString> names;
+        for (const auto& info : viewport.ModelInfos())
+        {
+            Require(!info.name.isEmpty() && !info.name.endsWith(".stl", Qt::CaseInsensitive), "invalid display name");
+            Require(!names.contains(info.name.toCaseFolded()), "duplicate model name");
+            names.insert(info.name.toCaseFolded());
+        }
+    };
+    Run("imports strip only the STL suffix and number repeated names", [&]()
+    {
+        const QString source = directory + QStringLiteral("/打印.零件.STL");
+        WriteBytes(source, ReadBytes(QStringLiteral(TEST_ASSET_DIR "/cube_30mm.stl")));
+        const auto first = load(source), second = load(source);
+        Require(viewport.ModelInfo(first)->name == QStringLiteral("打印.零件") &&
+                viewport.ModelInfo(second)->name == QStringLiteral("打印.零件 (2)"), "import names not derived/numbered");
+        Require(QString::fromUtf8(viewport.ModelInfo(first)->path.c_str()) == source, "source path renamed");
+        unique_names();
+    });
+    Run("rename is one undo step, preserves geometry and presentation, and survives saving", [&]()
+    {
+        viewport.NewProject();
+        const auto id = load(QStringLiteral(TEST_ASSET_DIR "/cube_30mm.stl"));
+        viewport.SetModelSelected(id, true);
+        viewport.SetModelVisible(id, false);
+        viewport.SetModelBoundingBoxVisible(id, true);
+        const auto info = *viewport.ModelInfo(id);
+        const auto before = viewport.SnapshotProject();
+        const auto revision = viewport.ProjectRevision(), history = viewport.HistoryRevision();
+        Require(viewport.RenameModel(id, QStringLiteral("  打印件 A.stl  "), error), qPrintable(error));
+        auto expected = before;
+        expected.models[0].name = QStringLiteral("打印件 A");
+        Require(SameProject(expected, viewport.SnapshotProject()) &&
+                viewport.ModelInfo(id)->selected && !viewport.ModelInfo(id)->visible &&
+                viewport.ModelInfo(id)->bounding_box_visible && viewport.ModelInfo(id)->transform_revision == info.transform_revision,
+                "rename changed geometry/presentation or lost normalization");
+        Require(viewport.HistoryRevision() == history + 1 && viewport.ProjectRevision() != revision, "rename history/dirty state");
+        Require(viewport.Undo(error) && SameProject(before, viewport.SnapshotProject()) && viewport.ProjectRevision() == revision,
+                "rename undo not exact");
+        Require(viewport.Redo(error) && SameProject(expected, viewport.SnapshotProject()), "rename redo not exact");
+        viewport.RemoveStl(id);
+        Require(viewport.Undo(error) && viewport.ModelInfo(id)->name == QStringLiteral("打印件 A"), "deleted name not restored");
+        const QString file = directory + "/names.glproj";
+        ProjectData read;
+        Require(ProjectFile::Write(file, expected, error) && ProjectFile::Read(file, read, error) &&
+                SameProject(read, expected) && viewport.ApplyProject(read, error) &&
+                SameProject(viewport.SnapshotProject(), expected), "name lost in project roundtrip");
+    });
+    Run("empty, duplicate, oversized and invalid names preserve history; no-op preserves redo", [&]()
+    {
+        viewport.NewProject();
+        const auto first = load(QStringLiteral(TEST_ASSET_DIR "/cube_30mm.stl"));
+        const auto second = load(QStringLiteral(TEST_ASSET_DIR "/torus_30mm.stl"));
+        const auto before = viewport.SnapshotProject();
+        const auto history = viewport.HistoryRevision(), revision = viewport.ProjectRevision();
+        for (const QString& invalid : {QString(), QStringLiteral("  "), QStringLiteral(".STL"),
+             QStringLiteral("TORUS_30MM"), QStringLiteral("torus_30mm.stl"), QString(257, QChar('a')), QStringLiteral("a\nb")})
+            Require(!viewport.RenameModel(first, invalid, error) && !error.isEmpty(), "invalid name accepted");
+        Require(!viewport.RenameModel(0, "missing", error), "missing rename target accepted");
+        Require(SameProject(before, viewport.SnapshotProject()) && viewport.HistoryRevision() == history &&
+                viewport.ProjectRevision() == revision, "invalid rename mutated project");
+        Require(viewport.RenameModel(first, "renamed", error) && viewport.Undo(error) && viewport.CanRedo(), "prepare rename redo");
+        const auto undo_history = viewport.HistoryRevision();
+        Require(viewport.RenameModel(first, " cube_30mm.STL ", error) && viewport.CanRedo() &&
+                viewport.HistoryRevision() == undo_history && SameProject(before, viewport.SnapshotProject()), "no-op rename cleared redo");
+        Require(viewport.RenameModel(second, "branch", error) && !viewport.CanRedo(), "new rename kept abandoned redo");
+        ProjectData invalid = viewport.SnapshotProject();
+        invalid.models[1].name = invalid.models[0].name;
+        const auto current = viewport.SnapshotProject();
+        Require(!viewport.ApplyProject(invalid, error) && SameProject(current, viewport.SnapshotProject()), "duplicate project names accepted");
+    });
+    Run("numbering long Unicode names stays valid and survives UTF-8 persistence", [&]()
+    {
+        viewport.NewProject();
+        const auto id = load(QStringLiteral(TEST_ASSET_DIR "/cube_30mm.stl"));
+        const QString emoji = QString::fromUtf8("\xF0\x9F\x98\x80");
+        QString long_name;
+        for (int i = 0; i < 128; ++i) long_name += emoji;
+        Require(viewport.RenameModel(id, long_name, error), qPrintable(error));
+        viewport.SetModelSelected(id, true);
+        Require(viewport.DuplicateSelectedModels(error) && viewport.ArraySelectedModels(1, 3, {5, 5}, error),
+                "long name duplication failed");
+        unique_names();
+        const auto expected = viewport.SnapshotProject();
+        const QString file = directory + "/unicode-names.glproj";
+        ProjectData read;
+        Require(ProjectFile::Write(file, expected, error) && ProjectFile::Read(file, read, error) &&
+                SameProject(read, expected), "Unicode copy names changed in persistence");
+    });
+    Run("copies and multi-model arrays avoid reserved names and retain names through undo/redo", [&]()
+    {
+        viewport.NewProject();
+        const QString source = QStringLiteral(TEST_ASSET_DIR "/cube_30mm.stl");
+        const auto original = load(source), peer = load(source);
+        Require(viewport.RenameModel(peer, "cube_30mm (3)", error), "reserve numbered name");
+        viewport.SetModelSelected(original, true);
+        const auto before_copy = viewport.SnapshotProject();
+        Require(viewport.DuplicateSelectedModels(error), qPrintable(error));
+        Require(viewport.ModelInfos().back().name == QStringLiteral("cube_30mm (2)"), "copy failed to avoid reserved name");
+        const auto copy = viewport.SnapshotProject();
+        unique_names();
+        Require(viewport.Undo(error) && SameProject(before_copy, viewport.SnapshotProject()) &&
+                viewport.Redo(error) && SameProject(copy, viewport.SnapshotProject()), "copy name undo/redo");
+        viewport.ClearModelSelection();
+        viewport.SetModelSelected(original, true);
+        viewport.SetModelSelected(peer, true);
+        const auto before_array = viewport.SnapshotProject();
+        Require(viewport.ArraySelectedModels(2, 3, {5, 5}, error), qPrintable(error));
+        unique_names();
+        const auto array = viewport.SnapshotProject();
+        Require(viewport.Undo(error) && SameProject(before_array, viewport.SnapshotProject()) &&
+                viewport.Redo(error) && SameProject(array, viewport.SnapshotProject()), "array name undo/redo");
+        ProjectData read;
+        const QString file = directory + "/named-array.glproj";
+        Require(ProjectFile::Write(file, array, error) && ProjectFile::Read(file, read, error) &&
+                viewport.ApplyProject(read, error) && SameProject(array, viewport.SnapshotProject()), "array names not persisted");
+        load(source);
+        unique_names();
     });
 }
 
@@ -1377,7 +1791,8 @@ void UiTests(const QString& directory)
         WithFile(model, [&]() { Trigger(window, "openStlAction"); });
         WithFile(model, [&]() { Trigger(window, "openStlAction"); });
         const auto id = viewport.ModelInfos()[0].id;
-        window.findChild<QToolButton*>("selectModelButton")->click();
+        auto* model_list = window.findChild<QListWidget*>("stlModelList");
+        model_list->itemWidget(model_list->item(0))->findChild<QToolButton*>("selectModelButton")->click();
         const QString transform_project = directory + QStringLiteral("/参数编辑.glproj");
         WithFile(transform_project, [&]() { Trigger(window, "saveProjectAction"); });
         auto* move = window.findChild<QPushButton*>("modelTranslateButton");
@@ -1482,6 +1897,191 @@ void UiTests(const QString& directory)
         selection_buttons[0]->click();
         Require(!viewport.ModelInfo(id)->selected, "selection button remained locked after close");
     });
+    Run("copy and array actions, dialog validation, cancel, undo and save", [&]()
+    {
+        viewport.NewProject();
+        WithFile(model, [&]() { Trigger(window, "openStlAction"); });
+        auto* duplicate = window.findChild<QAction*>("duplicateModelsAction");
+        auto* array = window.findChild<QAction*>("modelArrayAction");
+        auto* toolbar = window.findChild<QToolBar*>("mainToolBar");
+        Require(duplicate && array && !duplicate->isEnabled() && !array->isEnabled() &&
+                toolbar->actions().contains(duplicate) && toolbar->actions().contains(array) &&
+                !duplicate->icon().isNull() && !array->icon().isNull(), "duplication toolbar state/icons");
+        Require(duplicate->shortcut() == QKeySequence("Ctrl+D") && array->shortcut() == QKeySequence("Ctrl+Shift+D"), "duplication shortcuts");
+        auto* model_list = window.findChild<QListWidget*>("stlModelList");
+        model_list->itemWidget(model_list->item(0))->findChild<QToolButton*>("selectModelButton")->click();
+        Require(duplicate->isEnabled() && array->isEnabled(), "selection did not enable duplication");
+        const auto original = viewport.ModelInfos()[0].id;
+        Trigger(window, "duplicateModelsAction");
+        Require(viewport.ModelCount() == 2 && window.isWindowModified() &&
+                window.findChild<QListWidget*>("stlModelList")->count() == 2, "UI duplicate list/title");
+        Trigger(window, "undoAction");
+        Require(viewport.ModelCount() == 1 && viewport.ModelInfo(original)->selected, "UI duplicate undo");
+        const auto history = viewport.HistoryRevision();
+        WithDialog([&](QDialog* dialog)
+        {
+            Require(dialog->objectName() == QStringLiteral("modelArrayDialog"), "wrong array dialog");
+            auto* rows = dialog->findChild<QSpinBox*>("arrayRowsSpinBox");
+            auto* columns = dialog->findChild<QSpinBox*>("arrayColumnsSpinBox");
+            auto* x = dialog->findChild<QDoubleSpinBox*>("arrayGapXSpinBox");
+            auto* y = dialog->findChild<QDoubleSpinBox*>("arrayGapYSpinBox");
+            auto* generate = dialog->findChild<QPushButton*>("generateModelArrayButton");
+            Require(rows && columns && x && y && generate && rows->value() == 2 && columns->value() == 2 &&
+                    x->value() == 5 && y->value() == 5, "array defaults/fields");
+            rows->setValue(1); columns->setValue(1);
+            Require(!generate->isEnabled(), "1x1 generation enabled");
+            rows->setValue(100); columns->setValue(100);
+            Require(!generate->isEnabled(), "excessive generation enabled");
+            dialog->reject();
+        }, [&]() { Trigger(window, "modelArrayAction"); });
+        Require(viewport.ModelCount() == 1 && viewport.HistoryRevision() == history && viewport.CanRedo(), "cancel altered array or redo history");
+        WithDialog([&](QDialog* dialog)
+        {
+            dialog->findChild<QSpinBox*>("arrayRowsSpinBox")->setValue(2);
+            dialog->findChild<QSpinBox*>("arrayColumnsSpinBox")->setValue(3);
+            dialog->findChild<QDoubleSpinBox*>("arrayGapXSpinBox")->setValue(7.5);
+            dialog->findChild<QDoubleSpinBox*>("arrayGapYSpinBox")->setValue(12.25);
+            Require(dialog->findChild<QLabel*>("arraySummaryLabel")->text().contains(QStringLiteral("新增 5 个")), "array count summary");
+            dialog->findChild<QPushButton*>("generateModelArrayButton")->click();
+        }, [&]() { Trigger(window, "modelArrayAction"); });
+        const auto expected = viewport.SnapshotProject();
+        Require(viewport.ModelCount() == 6 && viewport.HistoryRevision() == history + 1 && !viewport.CanRedo(), "UI array generation/history");
+        Trigger(window, "undoAction");
+        Require(viewport.ModelCount() == 1 && window.findChild<QListWidget*>("stlModelList")->count() == 1, "UI array undo list");
+        Trigger(window, "redoAction");
+        Require(SameProject(expected, viewport.SnapshotProject()), "UI array redo");
+        const QString array_project = directory + QStringLiteral("/界面阵列.glproj");
+        WithFile(array_project, [&]() { Trigger(window, "saveProjectAsAction"); });
+        ProjectData saved;
+        Require(!window.isWindowModified() && ProjectFile::Read(array_project, saved, error) &&
+                SameProject(expected, saved), "UI array save");
+        window.findChild<QPushButton*>("modelRotateButton")->click();
+        Require(!duplicate->isEnabled() && !array->isEnabled(), "duplication enabled in transform session");
+        window.findChild<QDialog*>("modelTransformDialog")->close();
+        Require(duplicate->isEnabled() && array->isEnabled(), "duplication stayed disabled after transform close");
+    });
+    Run("place-on-plate toolbar updates bounds, supports undo redo and persists in project", [&]()
+    {
+        viewport.NewProject();
+        WithFile(model, [&]() { Trigger(window, "openStlAction"); });
+        auto* action = window.findChild<QAction*>("placeOnPlateAction");
+        auto* toolbar = window.findChild<QToolBar*>("mainToolBar");
+        Require(action && toolbar->actions().contains(action) && !action->isEnabled() &&
+                !action->icon().isNull() && action->shortcut() == QKeySequence("Ctrl+L"), "plate placement action/shortcut state");
+        const auto id = viewport.ModelInfos()[0].id;
+        Require(viewport.TransformModelTo(id, {{12, -8, 45}, {1.2f, 0.7f, 1.5f}, {35, 40, 25}}, TransformMode::Rotate), "raise UI placement model");
+        auto* list = window.findChild<QListWidget*>("stlModelList");
+        list->itemWidget(list->item(0))->findChild<QToolButton*>("selectModelButton")->click();
+        Require(action->isEnabled(), "selection did not enable placement");
+        const QString path = directory + QStringLiteral("/界面贴合基板.glproj");
+        WithFile(path, [&]() { Trigger(window, "saveProjectAsAction"); });
+        const auto before = viewport.SnapshotProject();
+        const auto position = viewport.ModelInfo(id)->world_position_mm;
+        Trigger(window, "placeOnPlateAction");
+        Require(window.isWindowModified() && viewport.ModelInfo(id)->world_bounds_min_mm.z == 0 &&
+                glm::length(glm::vec2(viewport.ModelInfo(id)->world_position_mm - position)) < 0.001f,
+                "UI placement bounds/title/XY wrong");
+        Require(window.findChild<QLabel*>("modelBoundsMinZ")->text() == QLocale().toString(0.0, 'f', 2), "Z label not zero");
+        const auto placed = viewport.SnapshotProject();
+        Trigger(window, "undoAction");
+        Require(SameProject(before, viewport.SnapshotProject()), "UI placement undo");
+        Trigger(window, "redoAction");
+        Require(SameProject(placed, viewport.SnapshotProject()), "UI placement redo");
+        Trigger(window, "saveProjectAction");
+        ProjectData saved;
+        Require(!window.isWindowModified() && ProjectFile::Read(path, saved, error) && SameProject(placed, saved), "UI placement save");
+        const auto history = viewport.HistoryRevision();
+        Trigger(window, "placeOnPlateAction");
+        Require(!window.isWindowModified() && viewport.HistoryRevision() == history, "UI no-op placement dirtied project");
+        window.findChild<QPushButton*>("modelRotateButton")->click();
+        Require(!action->isEnabled(), "placement enabled while transform window open");
+        window.findChild<QDialog*>("modelTransformDialog")->close();
+        Require(action->isEnabled(), "placement stayed disabled after transform close");
+    });
+    Run("model list double-click renames, validates, cancels, updates details and persists names", [&]()
+    {
+        viewport.NewProject();
+        WithFile(model, [&]() { Trigger(window, "openStlAction"); });
+        WithFile(model, [&]() { Trigger(window, "openStlAction"); });
+        auto* list = window.findChild<QListWidget*>("stlModelList");
+        const auto original = viewport.ModelInfos()[0].id;
+        auto row = [&](int index) { return list->itemWidget(list->item(index)); };
+        auto label = [&](int index) { return row(index)->findChild<QLabel*>("modelRowName"); };
+        Require(list->item(0)->text() == QStringLiteral("cube_30mm") &&
+                label(1)->text() == QStringLiteral("cube_30mm (2)"), "UI import names not numbered/stripped");
+        const QString path = directory + "/ui-names.glproj";
+        WithFile(path, [&]() { Trigger(window, "saveProjectAsAction"); });
+        auto double_click = [&](QWidget* target)
+        {
+            QMouseEvent event(QEvent::MouseButtonDblClick, QPointF(8, 8),
+                              Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+            QApplication::sendEvent(target, &event);
+        };
+        auto history = viewport.HistoryRevision();
+        WithDialog([&](QDialog* dialog)
+        {
+            auto* field = dialog->findChild<QLineEdit*>("modelNameEdit");
+            Require(dialog->objectName() == QStringLiteral("renameModelDialog") && field &&
+                    field->text() == QStringLiteral("cube_30mm") && field->selectedText() == field->text(),
+                    "double-click did not open prefilled name editor");
+            field->setText(QStringLiteral("取消的名称"));
+            dialog->reject();
+        }, [&]() { double_click(label(0)); });
+        Require(!window.isWindowModified() && viewport.HistoryRevision() == history &&
+                viewport.ModelInfo(original)->name == QStringLiteral("cube_30mm") &&
+                !viewport.ModelInfo(original)->selected, "cancel changed name or selection");
+
+        WithDialog([&](QDialog* dialog)
+        {
+            auto* field = dialog->findChild<QLineEdit*>("modelNameEdit");
+            auto* apply = dialog->findChild<QPushButton*>("renameModelButton");
+            Require(field && apply, "missing rename controls");
+            field->clear();
+            apply->click();
+            Require(dialog->isVisible() && viewport.HistoryRevision() == history, "empty rename accepted");
+            field->setText(QStringLiteral("CUBE_30MM (2)"));
+            apply->click();
+            Require(dialog->isVisible() && viewport.HistoryRevision() == history &&
+                    !dialog->findChild<QLabel*>("modelNameHint")->text().isEmpty(), "duplicate rename accepted");
+            field->setText(QStringLiteral("  打印零件.stl  "));
+            apply->click();
+        }, [&]() { double_click(label(0)); });
+        Require(viewport.ModelInfo(original)->name == QStringLiteral("打印零件") &&
+                list->item(0)->text() == QStringLiteral("打印零件") && label(0)->text() == QStringLiteral("打印零件") &&
+                window.isWindowModified() && viewport.HistoryRevision() == history + 1 &&
+                !viewport.ModelInfo(original)->selected, "UI rename did not update list/history");
+        row(0)->findChild<QToolButton*>("selectModelButton")->click();
+        Require(window.findChild<QLabel*>("modelName")->text() == QStringLiteral("打印零件"), "renamed details missing");
+        Trigger(window, "undoAction");
+        Require(list->item(0)->text() == QStringLiteral("cube_30mm") && label(0)->text() == QStringLiteral("cube_30mm") &&
+                window.findChild<QLabel*>("modelName")->text() == QStringLiteral("cube_30mm") && window.isWindowModified(),
+                "UI rename undo not synchronized");
+        history = viewport.HistoryRevision();
+        WithDialog([](QDialog* dialog) { dialog->reject(); }, [&]() { double_click(row(0)); });
+        Require(viewport.CanRedo() && viewport.HistoryRevision() == history, "cancelled row rename cleared redo");
+        Trigger(window, "redoAction");
+        Require(label(0)->text() == QStringLiteral("打印零件") &&
+                window.findChild<QLabel*>("modelName")->text() == QStringLiteral("打印零件"), "UI rename redo not synchronized");
+        row(0)->findChild<QToolButton*>("toggleModelVisibilityButton")->click();
+        WithDialog([](QDialog* dialog)
+        {
+            dialog->findChild<QLineEdit*>("modelNameEdit")->setText(QStringLiteral("隐藏打印件"));
+            dialog->findChild<QPushButton*>("renameModelButton")->click();
+        }, [&]() { double_click(label(0)); });
+        Require(!viewport.ModelInfo(original)->visible && viewport.ModelInfo(original)->selected &&
+                label(0)->text() == QStringLiteral("隐藏打印件"), "hidden model rename failed");
+        Trigger(window, "saveProjectAction");
+        ProjectData saved;
+        Require(!window.isWindowModified() && ProjectFile::Read(path, saved, error) &&
+                saved.models[0].name == QStringLiteral("隐藏打印件") &&
+                saved.models[1].name == QStringLiteral("cube_30mm (2)"), "UI names not saved");
+        WithFile(path, [&]() { Trigger(window, "openProjectAction"); });
+        Require(list->item(0)->text() == QStringLiteral("隐藏打印件") &&
+                label(1)->text() == QStringLiteral("cube_30mm (2)"), "UI reopen lost names");
+        row(0)->findChild<QToolButton*>("selectModelButton")->click();
+        Trigger(window, "duplicateModelsAction");
+        Require(label(2)->text() == QStringLiteral("隐藏打印件 (2)"), "UI copy shares source name");
+    });
     qApp->removeEventFilter(&filter);
 }
 } // namespace
@@ -1518,6 +2118,9 @@ int main(int argc, char* argv[])
     if (argc == 3 && (capture_mode == QStringLiteral("--capture-history") ||
                      capture_mode == QStringLiteral("--capture-toolbar") ||
                      capture_mode == QStringLiteral("--capture-platform") ||
+                     capture_mode == QStringLiteral("--capture-rename") ||
+                     capture_mode == QStringLiteral("--capture-array-dialog") ||
+                     capture_mode == QStringLiteral("--capture-array-view") ||
                      capture_mode == QStringLiteral("--capture-model-transform") ||
                      capture_mode.startsWith(QStringLiteral("--capture-gizmo-"))))
     {
@@ -1536,6 +2139,23 @@ int main(int argc, char* argv[])
         viewport.EndModelMove();
         viewport.RemoveStl(infos[1].id);
         Require(viewport.Undo(error), "preview undo");
+        if (capture_mode == QStringLiteral("--capture-array-view"))
+        {
+            viewport.NewProject();
+            Require(viewport.LoadStl(TEST_ASSET_DIR "/cube_30mm.stl", load_error, size), "array preview import");
+            viewport.SetModelSelected(viewport.ModelInfos()[0].id, true);
+            Require(viewport.SetPlateSizeMm({160, 130}, error) && viewport.ArraySelectedModels(2, 3, {5, 8}, error), "array preview generate");
+            viewport.ResetView();
+            Require(viewport.RenderFrame() && viewport.RenderFrame(), "array preview render");
+            const auto& io = ImGui::GetIO();
+            const int width = static_cast<int>(io.DisplaySize.x * io.DisplayFramebufferScale.x);
+            const int height = static_cast<int>(io.DisplaySize.y * io.DisplayFramebufferScale.y);
+            QImage pixels(width, height, QImage::Format_RGBA8888);
+            glReadBuffer(GL_FRONT);
+            glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels.bits());
+            Require(pixels.mirrored().save(QString::fromLocal8Bit(argv[2])), "capture array view");
+            return 0;
+        }
         if (capture_mode.startsWith(QStringLiteral("--capture-gizmo-")))
         {
             const auto id = infos[0].id;
@@ -1573,6 +2193,36 @@ int main(int argc, char* argv[])
             Require(dock && dock->grab().save(QString::fromLocal8Bit(argv[2]) + ".dock.png"), "capture transform buttons");
             dialog->reject();
         }
+        else if (capture_mode == QStringLiteral("--capture-rename"))
+        {
+            Require(viewport.DuplicateSelectedModels(error), qPrintable(error));
+            // The window refreshes its list after undo/redo.
+            Trigger(window, "undoAction");
+            Trigger(window, "redoAction");
+            auto* dock = window.findChild<QDockWidget*>("stlModelDock");
+            Require(dock->grab().save(QString::fromLocal8Bit(argv[2]) + ".dock.png"), "capture model names");
+            auto* list = window.findChild<QListWidget*>("stlModelList");
+            auto* name = list->itemWidget(list->item(0))->findChild<QLabel*>("modelRowName");
+            WithDialog([&](QDialog* dialog)
+            {
+                Require(dialog->grab().save(QString::fromLocal8Bit(argv[2])), "capture rename dialog");
+                dialog->reject();
+            }, [&]()
+            {
+                QMouseEvent event(QEvent::MouseButtonDblClick, QPointF(8, 8),
+                                  Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+                QApplication::sendEvent(name, &event);
+            });
+        }
+        else if (capture_mode == QStringLiteral("--capture-array-dialog"))
+        {
+            WithDialog([&](QDialog* dialog)
+            {
+                dialog->findChild<QSpinBox*>("arrayColumnsSpinBox")->setValue(3);
+                Require(dialog->grab().save(QString::fromLocal8Bit(argv[2])), "capture array dialog");
+                dialog->reject();
+            }, [&]() { Trigger(window, "modelArrayAction"); });
+        }
         else if (capture_mode == QStringLiteral("--capture-platform"))
         {
             Require(viewport.SetPlateSizeMm({240, 160}, error), qPrintable(error));
@@ -1601,6 +2251,9 @@ int main(int argc, char* argv[])
         PlateTests(directory.path());
         TransformTests(directory.path());
         HistoryTests(directory.path());
+        DuplicationTests(directory.path());
+        PlatePlacementTests(directory.path());
+        NamingTests(directory.path());
         Run("welcome New button enters an unnamed project", [&]()
         {
             WelcomeDialog welcome(directory.path() + QStringLiteral("/empty_recent.json"));

@@ -1,4 +1,5 @@
 #include "project_file.h"
+#include "model_names.h"
 
 #include <QDataStream>
 #include <QFile>
@@ -10,7 +11,7 @@
 namespace
 {
 constexpr quint32 kMagic = 0x474C5052; // GLPR
-constexpr quint32 kVersion = 3;
+constexpr quint32 kVersion = 4;
 constexpr quint32 kMaxModels = 10000;
 constexpr quint32 kMaxPathBytes = 1024 * 1024;
 // Qt 5 QByteArray is int-sized. Bound allocations before reading file data.
@@ -83,8 +84,19 @@ bool ProjectFile::Validate(const ProjectData& project, QString& error)
         return false;
     }
     bool valid = project.models.size() <= kMaxModels;
+    QSet<QString> names;
     for (const auto& model : project.models)
     {
+        // Empty names are allowed for programmatic/legacy documents and derived on load/save.
+        if (!model.name.isEmpty())
+        {
+            if (!ModelNames::IsValid(model.name) || names.contains(model.name.toCaseFolded()))
+            {
+                error = QStringLiteral("工程中的模型名称无效或重复。");
+                return false;
+            }
+            names.insert(model.name.toCaseFolded());
+        }
         valid = valid && !model.source_path.isEmpty() &&
             model.source_path.toUtf8().size() <= kMaxPathBytes &&
             !model.stl_data.isEmpty() && model.stl_data.size() <= kMaxModelBytes &&
@@ -116,7 +128,7 @@ bool ProjectFile::Read(const QString& path, ProjectData& project, QString& error
         error = QStringLiteral("这不是有效的 glSceneEditor 工程文件。");
         return false;
     }
-    if (version != 1 && version != 2 && version != kVersion)
+    if (version != 1 && version != 2 && version != 3 && version != kVersion)
     {
         error = QStringLiteral("不支持工程版本 %1，请使用兼容的软件版本。").arg(version);
         return false;
@@ -124,6 +136,7 @@ bool ProjectFile::Read(const QString& path, ProjectData& project, QString& error
 
     // Parse into a temporary document; failures never replace the caller's data.
     ProjectData loaded;
+    QSet<QString> names;
     bool valid = true;
     if (version == 1)
     {
@@ -152,6 +165,15 @@ bool ProjectFile::Read(const QString& path, ProjectData& project, QString& error
         ReadVector(stream, model.rotation_degrees);
         if (version >= 3)
             stream >> model.placement_center_mm.x >> model.placement_center_mm.y;
+        if (version >= 4)
+        {
+            QByteArray utf8_name;
+            valid = ReadBytes(stream, utf8_name, ModelNames::kMaxUtf8Bytes);
+            model.name = QString::fromUtf8(utf8_name);
+            valid = valid && ModelNames::IsValid(model.name) && model.name.toUtf8() == utf8_name;
+        }
+        else
+            model.name = ModelNames::Unique(ModelNames::FromPath(model.source_path), names);
         if (version == 1)
         {
             bool flag = false;
@@ -189,6 +211,9 @@ bool ProjectFile::Write(const QString& path, const ProjectData& project, QString
     stream << kMagic << kVersion;
     stream << project.plate_size_mm.x << project.plate_size_mm.y;
     stream << static_cast<quint32>(project.models.size());
+    QSet<QString> names;
+    for (const auto& model : project.models)
+        if (!model.name.isEmpty()) names.insert(model.name.toCaseFolded());
     for (const auto& model : project.models)
     {
         WriteBytes(stream, model.source_path.toUtf8());
@@ -197,6 +222,8 @@ bool ProjectFile::Write(const QString& path, const ProjectData& project, QString
         WriteVector(stream, model.scale);
         WriteVector(stream, model.rotation_degrees);
         stream << model.placement_center_mm.x << model.placement_center_mm.y;
+        WriteBytes(stream, (model.name.isEmpty()
+            ? ModelNames::Unique(ModelNames::FromPath(model.source_path), names) : model.name).toUtf8());
     }
     if (stream.status() != QDataStream::Ok || !file.commit())
     {

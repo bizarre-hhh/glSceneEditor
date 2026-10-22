@@ -50,6 +50,7 @@ public:
         bool bounding_box_visible = false;
         std::size_t source_file_size = 0;
         glm::vec2 placement_center_mm{PlateDimensions::kDefaultMm * 0.5f};
+        QString name;
     };
 
     SceneViewport();
@@ -63,6 +64,12 @@ public:
     bool RenderFrame(); // false requests application shutdown
     void ReleaseCursor();
     bool LoadStl(const std::string& path, std::string& error, glm::vec3& size_mm);
+    static constexpr std::size_t kMaxGeneratedModels = 1000;
+    bool DuplicateSelectedModels(QString& error);
+    bool RenameModel(ModelId id, const QString& name, QString& error);
+    bool PlaceSelectedModelsOnPlate(QString& error);
+    // Rows/columns include the originals; gaps are between the selected group's bounds.
+    bool ArraySelectedModels(int rows, int columns, const glm::vec2& gap_mm, QString& error);
     // Numeric edits are one step; Begin/End merge an entire gizmo gesture.
     bool BeginModelTransform(ModelId id, TransformMode mode);
     bool TransformModelTo(ModelId id, const ModelTransform& transform, TransformMode mode);
@@ -137,11 +144,26 @@ private:
         std::uint64_t selection_order = 0;
         std::size_t index = 0;
     };
-    enum class OperationKind { Import, Delete, Transform, PlateSize };
+    struct SavedSelection
+    {
+        ModelId id = 0;
+        std::uint64_t order = 0;
+    };
+    struct ModelTransformChange
+    {
+        ModelId id = 0;
+        ModelTransform before;
+        ModelTransform after;
+    };
+    enum class OperationKind { Import, Delete, Transform, PlateSize, AddModels, TransformModels, Rename };
     struct Operation
     {
         OperationKind kind = OperationKind::Import;
         SavedModel model;
+        std::vector<SavedModel> added_models;
+        std::vector<ModelTransformChange> transforms;
+        std::vector<SavedSelection> previous_selection;
+        ModelId previous_active_id = 0;
         ModelTransform before_transform;
         ModelTransform after_transform;
         glm::vec2 before_plate_size{PlateDimensions::kDefaultMm};
@@ -149,6 +171,8 @@ private:
         std::uint64_t before_revision = 0;
         std::uint64_t after_revision = 0;
         QString description;
+        QString before_name;
+        QString after_name;
     };
     struct PendingTransform
     {
@@ -159,8 +183,14 @@ private:
     };
     SavedModel CaptureModel(const ModelEntry& entry) const;
     bool RestoreModel(const SavedModel& saved, QString& error);
+    bool RestoreModels(const std::vector<SavedModel>& saved, QString& error);
+    bool BuildModelEntry(const SavedModel& saved, ModelEntry& entry, QString& error);
+    bool RepeatSelectedModels(int rows, int columns, const glm::vec2& gap_mm,
+                              bool duplicate, QString& error);
+    void RestoreSelection(const std::vector<SavedSelection>& selection, ModelId active_id);
     void EraseModel(ModelId id);
     bool ApplyTransform(ModelEntry& entry, const ModelTransform& transform);
+    bool ApplyTransforms(const std::vector<ModelTransformChange>& changes, bool forward);
     bool DrawModelGizmo(const glm::mat4& view, const glm::mat4& projection, bool over_cube);
     void RecordOperation(Operation operation);
     void AppendHistory(const QString& description);

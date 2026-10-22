@@ -17,6 +17,7 @@ struct ProjectModel
     glm::vec3 scale{1.0f};
     glm::vec3 rotation_degrees{0.0f};
     glm::vec2 placement_center_mm{PlateDimensions::kDefaultMm * 0.5f};
+    QString name;
 };
 
 struct ProjectData

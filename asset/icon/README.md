@@ -18,5 +18,8 @@
 | 重置视角 | `house.svg` | Home 视角 |
 | 场景设置 | `settings.svg` | 齿轮 |
 | 平台尺寸 | `ruler.svg` | 尺寸标尺 |
+| 复制模型 | `duplicate-model.svg` | 两个叠放的模型 |
+| 矩形阵列 | `model-array.svg` | 四个网格单元 |
+| 贴合基板 | `drop-to-plate.svg` | 模型向下贴合平台 |
 
-`toolbar_icons.qrc` 将图标和原始许可证嵌入程序，不依赖启动目录。修改 SVG 后重新构建即可更新图标。`source.json` 记录来源及改动；`LICENSE-Lucide.txt` 保留上游完整的 ISC / MIT 许可声明。
+新增的 `duplicate-model.svg`、`model-array.svg` 和 `drop-to-plate.svg` 为项目自行绘制的 SVG，使用与现有图标一致的描边颜色和尺寸，不属于上述 Lucide 源文件。`toolbar_icons.qrc` 将图标和原始许可证嵌入程序，不依赖启动目录。修改 SVG 后重新构建即可更新图标。`source.json` 记录来源及改动；`LICENSE-Lucide.txt` 保留上游完整的 ISC / MIT 许可声明。

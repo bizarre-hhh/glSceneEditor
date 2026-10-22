@@ -20,6 +20,8 @@
 #include <QIcon>
 #include <QKeySequence>
 #include <QLabel>
+#include <QLineEdit>
+#include <QMouseEvent>
 #include <QListWidget>
 #include <QLocale>
 #include <QMenu>
@@ -31,6 +33,7 @@
 #include <QScrollArea>
 #include <QSignalBlocker>
 #include <QSplitter>
+#include <QSpinBox>
 #include <QStatusBar>
 #include <QStyle>
 #include <QToolBar>
@@ -41,8 +44,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 #include "scene_viewport.h"
+#include "model_names.h"
 
 namespace
 {
@@ -151,6 +156,29 @@ SceneEditorWindow::SceneEditorWindow(SceneViewport& viewport, const QString& pro
     connect(quit_action, &QAction::triggered, this, [this]() { close(); });
 
     QMenu* edit_menu = menuBar()->addMenu(QStringLiteral("编辑(&E)"));
+    duplicate_action_ = edit_menu->addAction(QStringLiteral("复制模型"));
+    duplicate_action_->setObjectName(QStringLiteral("duplicateModelsAction"));
+    duplicate_action_->setIcon(QIcon(QStringLiteral(":/icons/duplicate-model.svg")));
+    duplicate_action_->setShortcut(QKeySequence(QStringLiteral("Ctrl+D")));
+    duplicate_action_->setToolTip(QStringLiteral("复制选中模型，沿 X 方向保留 5 mm 间隙 (Ctrl+D)"));
+    duplicate_action_->setEnabled(false);
+    connect(duplicate_action_, &QAction::triggered, this, &SceneEditorWindow::DuplicateModels);
+    array_action_ = edit_menu->addAction(QStringLiteral("矩形阵列…"));
+    array_action_->setObjectName(QStringLiteral("modelArrayAction"));
+    array_action_->setIcon(QIcon(QStringLiteral(":/icons/model-array.svg")));
+    array_action_->setIconText(QStringLiteral("矩形阵列"));
+    array_action_->setShortcut(QKeySequence(QStringLiteral("Ctrl+Shift+D")));
+    array_action_->setToolTip(QStringLiteral("按行列及 X/Y 间隙重复排列选中模型 (Ctrl+Shift+D)"));
+    array_action_->setEnabled(false);
+    connect(array_action_, &QAction::triggered, this, &SceneEditorWindow::ArrayModels);
+    place_on_plate_action_ = edit_menu->addAction(QStringLiteral("贴合基板"));
+    place_on_plate_action_->setObjectName(QStringLiteral("placeOnPlateAction"));
+    place_on_plate_action_->setIcon(QIcon(QStringLiteral(":/icons/drop-to-plate.svg")));
+    place_on_plate_action_->setShortcut(QKeySequence(QStringLiteral("Ctrl+L")));
+    place_on_plate_action_->setToolTip(QStringLiteral("使选中模型的最低 Z 为 0，保持 X/Y 位置不变 (Ctrl+L)"));
+    place_on_plate_action_->setEnabled(false);
+    connect(place_on_plate_action_, &QAction::triggered, this, &SceneEditorWindow::PlaceModelsOnPlate);
+    edit_menu->addSeparator();
     undo_action_ = edit_menu->addAction(QStringLiteral("撤销"));
     undo_action_->setObjectName(QStringLiteral("undoAction"));
     undo_action_->setIcon(QIcon(QStringLiteral(":/icons/undo-2.svg")));
@@ -208,6 +236,9 @@ SceneEditorWindow::SceneEditorWindow(SceneViewport& viewport, const QString& pro
     toolbar->addAction(save_as_action);
     toolbar->addSeparator();
     toolbar->addAction(open_stl_action);
+    toolbar->addAction(duplicate_action_);
+    toolbar->addAction(array_action_);
+    toolbar->addAction(place_on_plate_action_);
     toolbar->addSeparator();
     toolbar->addAction(undo_action_);
     toolbar->addAction(redo_action_);
@@ -357,6 +388,147 @@ void SceneEditorWindow::OpenProject()
     statusBar()->showMessage(QStringLiteral("已打开工程：%1 | %2 个模型")
         .arg(QFileInfo(path).fileName()).arg(static_cast<qulonglong>(viewport_.ModelCount())));
     RememberCurrentProject();
+}
+
+void SceneEditorWindow::DuplicateModels()
+{
+    RenderPause pause(render_timer_, viewport_);
+    QString error;
+    if (!viewport_.DuplicateSelectedModels(error))
+    {
+        QMessageBox::warning(this, QStringLiteral("无法复制模型"), error);
+        return;
+    }
+    UpdateModelSelection(true);
+    UpdateProjectState();
+    statusBar()->showMessage(viewport_.OperationHistory().back());
+}
+
+void SceneEditorWindow::PlaceModelsOnPlate()
+{
+    RenderPause pause(render_timer_, viewport_);
+    const auto history = viewport_.HistoryRevision();
+    QString error;
+    if (!viewport_.PlaceSelectedModelsOnPlate(error))
+    {
+        QMessageBox::warning(this, QStringLiteral("无法贴合基板"), error);
+        return;
+    }
+    UpdateModelSelection(true);
+    UpdateProjectState();
+    statusBar()->showMessage(viewport_.HistoryRevision() == history
+        ? QStringLiteral("选中模型已贴合基板，无需移动。") : viewport_.OperationHistory().back());
+}
+
+void SceneEditorWindow::ArrayModels()
+{
+    RenderPause pause(render_timer_, viewport_);
+    if (viewport_.IsTransformEditing()) return;
+    std::size_t selected_count = 0;
+    glm::vec2 minimum(std::numeric_limits<float>::max());
+    glm::vec2 maximum(std::numeric_limits<float>::lowest());
+    for (const auto& info : viewport_.ModelInfos())
+        if (info.selected)
+        {
+            ++selected_count;
+            minimum = glm::min(minimum, glm::vec2(info.world_bounds_min_mm));
+            maximum = glm::max(maximum, glm::vec2(info.world_bounds_max_mm));
+        }
+    if (selected_count == 0) return;
+    const glm::vec2 group_size = maximum - minimum;
+    QDialog dialog(this);
+    dialog.setObjectName(QStringLiteral("modelArrayDialog"));
+    dialog.setWindowTitle(QStringLiteral("矩形阵列"));
+    dialog.setWindowFlags(dialog.windowFlags() & ~Qt::WindowContextHelpButtonHint);
+    dialog.setFont(QFont(QStringLiteral("Microsoft YaHei"), 12));
+    dialog.setMinimumWidth(640);
+    auto* layout = new QVBoxLayout(&dialog);
+    layout->setContentsMargins(24, 22, 24, 22);
+    layout->setSpacing(18);
+    auto* hint = new QLabel(QStringLiteral(
+        "行列数包含原模型，沿世界 X/Y 正方向展开。\n"
+        "多选模型作为一个单元重复排列，间隙按包围盒计算。"), &dialog);
+    hint->setWordWrap(true);
+    layout->addWidget(hint);
+    auto* form = new QFormLayout;
+    form->setVerticalSpacing(16);
+    auto* columns = new QSpinBox(&dialog);
+    auto* rows = new QSpinBox(&dialog);
+    columns->setObjectName(QStringLiteral("arrayColumnsSpinBox"));
+    rows->setObjectName(QStringLiteral("arrayRowsSpinBox"));
+    for (auto* field : {columns, rows})
+    {
+        field->setRange(1, 100);
+        field->setValue(2);
+        field->setMinimumHeight(36);
+    }
+    auto* gap_x = new QDoubleSpinBox(&dialog);
+    auto* gap_y = new QDoubleSpinBox(&dialog);
+    gap_x->setObjectName(QStringLiteral("arrayGapXSpinBox"));
+    gap_y->setObjectName(QStringLiteral("arrayGapYSpinBox"));
+    for (auto* field : {gap_x, gap_y})
+    {
+        field->setRange(0.0, 10000.0);
+        field->setDecimals(2);
+        field->setSingleStep(1.0);
+        field->setSuffix(QStringLiteral(" mm"));
+        field->setValue(5.0);
+        field->setMinimumHeight(36);
+    }
+    form->addRow(QStringLiteral("列数（X 方向）"), columns);
+    form->addRow(QStringLiteral("行数（Y 方向）"), rows);
+    form->addRow(QStringLiteral("X 方向间隙"), gap_x);
+    form->addRow(QStringLiteral("Y 方向间隙"), gap_y);
+    layout->addLayout(form);
+    auto* summary = new QLabel(&dialog);
+    summary->setObjectName(QStringLiteral("arraySummaryLabel"));
+    summary->setWordWrap(true);
+    layout->addWidget(summary);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    auto* generate = buttons->button(QDialogButtonBox::Ok);
+    generate->setText(QStringLiteral("生成阵列"));
+    generate->setObjectName(QStringLiteral("generateModelArrayButton"));
+    buttons->button(QDialogButtonBox::Cancel)->setText(QStringLiteral("取消"));
+    const auto update_summary = [=, this]()
+    {
+        const auto total = selected_count * rows->value() * columns->value();
+        const auto added = total - selected_count;
+        const double width = group_size.x * static_cast<double>(columns->value()) + gap_x->value() * (columns->value() - 1);
+        const double height = group_size.y * static_cast<double>(rows->value()) + gap_y->value() * (rows->value() - 1);
+        const bool valid = added > 0 && added <= SceneViewport::kMaxGeneratedModels &&
+                           viewport_.ModelCount() + added <= 10000 &&
+                           std::isfinite(width) && std::isfinite(height);
+        generate->setEnabled(valid);
+        QString text = QStringLiteral("选中 %1 个模型；新增 %2 个副本。\n阵列总计 %3 个模型。\n占用范围：%4 × %5 mm")
+            .arg(static_cast<qulonglong>(selected_count)).arg(static_cast<qulonglong>(added))
+            .arg(static_cast<qulonglong>(total)).arg(width, 0, 'f', 2).arg(height, 0, 'f', 2);
+        if (!valid)
+            text += QStringLiteral("\n至少生成一个副本；一次最多新增 %1 个，工程最多 10000 个模型。")
+                .arg(static_cast<qulonglong>(SceneViewport::kMaxGeneratedModels));
+        else if (minimum.x < 0 || minimum.y < 0 || minimum.x + width > viewport_.PlateSizeMm().x ||
+                 minimum.y + height > viewport_.PlateSizeMm().y)
+            text += QStringLiteral("\n阵列将超出当前平台范围，可在生成后调整位置或平台尺寸。");
+        summary->setText(text);
+    };
+    connect(columns, qOverload<int>(&QSpinBox::valueChanged), &dialog, [=](int) { update_summary(); });
+    connect(rows, qOverload<int>(&QSpinBox::valueChanged), &dialog, [=](int) { update_summary(); });
+    connect(gap_x, qOverload<double>(&QDoubleSpinBox::valueChanged), &dialog, [=](double) { update_summary(); });
+    connect(gap_y, qOverload<double>(&QDoubleSpinBox::valueChanged), &dialog, [=](double) { update_summary(); });
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    layout->addWidget(buttons);
+    update_summary();
+    if (dialog.exec() != QDialog::Accepted) return;
+    QString error;
+    if (!viewport_.ArraySelectedModels(rows->value(), columns->value(),
+        {static_cast<float>(gap_x->value()), static_cast<float>(gap_y->value())}, error))
+    {
+        QMessageBox::warning(this, QStringLiteral("无法生成阵列"), error);
+        return;
+    }
+    UpdateModelSelection(true);
+    UpdateProjectState();
+    statusBar()->showMessage(viewport_.OperationHistory().back());
 }
 
 void SceneEditorWindow::EditPlateSize()
@@ -568,7 +740,7 @@ void SceneEditorWindow::EditModelTransform(TransformMode mode)
     }
     transform_dialog_model_id_ = info->id;
     transform_dialog_mode_ = mode;
-    const QString name = QFileInfo(QString::fromUtf8(info->path.c_str())).fileName();
+    const QString name = info->name;
     const QString operation = mode == TransformMode::Translate ? QStringLiteral("平移") :
         mode == TransformMode::Rotate ? QStringLiteral("旋转") : QStringLiteral("缩放");
     transform_dialog_->setWindowTitle(QStringLiteral("%1模型 — %2").arg(operation, name));
@@ -592,6 +764,9 @@ void SceneEditorWindow::UpdateModelTransformDialog(bool force)
         transform_dialog_->reject();
         return;
     }
+    const QString operation = transform_dialog_mode_ == TransformMode::Translate ? QStringLiteral("平移") :
+        transform_dialog_mode_ == TransformMode::Rotate ? QStringLiteral("旋转") : QStringLiteral("缩放");
+    transform_dialog_->setWindowTitle(QStringLiteral("%1模型 — %2").arg(operation, info->name));
     if (!force && info->transform_revision == transform_dialog_revision_) return;
     transform_dialog_revision_ = info->transform_revision;
     const auto values = transform_dialog_mode_ == TransformMode::Translate ? info->local_translation_mm :
@@ -673,6 +848,9 @@ void SceneEditorWindow::CreateModelDock()
     model_list_->setMinimumHeight(100);
     model_list_->setSelectionMode(QAbstractItemView::NoSelection);
     model_list_->setFocusPolicy(Qt::NoFocus);
+    model_list_->setToolTip(QStringLiteral("双击模型名称或列表行可修改名称"));
+    connect(model_list_, &QListWidget::itemDoubleClicked, this,
+        [this](QListWidgetItem* item) { RenameModel(item->data(Qt::UserRole).toULongLong()); });
 
     model_details_ = new QGroupBox(QStringLiteral("基本信息"), contents);
     QFormLayout* details_layout = new QFormLayout(model_details_);
@@ -693,7 +871,7 @@ void SceneEditorWindow::CreateModelDock()
             details_layout->addRow(title, label);
         return label;
     };
-    model_name_label_ = add_detail(QStringLiteral("文件名"), QStringLiteral("modelName"));
+    model_name_label_ = add_detail(QStringLiteral("模型名"), QStringLiteral("modelName"));
     model_path_edit_ = new QPlainTextEdit(model_details_);
     model_path_edit_->setObjectName(QStringLiteral("modelPath"));
     model_path_edit_->setReadOnly(true);
@@ -844,23 +1022,28 @@ void SceneEditorWindow::RefreshModelList()
             const QString path = QString::fromUtf8(info.path.c_str());
             QListWidgetItem* item = new QListWidgetItem(
                 style()->standardIcon(QStyle::SP_FileIcon),
-                QFileInfo(path).fileName(), model_list_);
+                info.name, model_list_);
             item->setFlags(item->flags() & ~Qt::ItemIsSelectable);
             item->setData(Qt::UserRole, QVariant::fromValue<qulonglong>(id));
             item->setToolTip(QDir::toNativeSeparators(path));
             model_items_.emplace(id, item);
 
             QWidget* row = new QWidget(model_list_);
+            row->setProperty("modelId", QVariant::fromValue<qulonglong>(id));
+            row->installEventFilter(this);
             row->setAutoFillBackground(true);
             row->setBackgroundRole(QPalette::Window);
             QHBoxLayout* row_layout = new QHBoxLayout(row);
             row_layout->setContentsMargins(4, 2, 4, 2);
             row_layout->setSpacing(4);
-            QLabel* name_label = new QLabel(QFileInfo(path).fileName(), row);
+            QLabel* name_label = new QLabel(info.name, row);
             name_label->setObjectName(QStringLiteral("modelRowName"));
             name_label->setTextFormat(Qt::PlainText);
             name_label->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
-            name_label->setToolTip(item->toolTip());
+            name_label->setToolTip(QStringLiteral("双击修改模型名称\n%1").arg(item->toolTip()));
+            name_label->setProperty("modelId", QVariant::fromValue<qulonglong>(id));
+            name_label->installEventFilter(this);
+            name_label->setCursor(Qt::PointingHandCursor);
             row_layout->addWidget(name_label, 1);
 
             QToolButton* selection_button = new QToolButton(row);
@@ -927,8 +1110,7 @@ void SceneEditorWindow::RefreshModelList()
                 const auto* current = viewport_.ModelInfo(id);
                 if (!current)
                     return;
-                const QString name = QFileInfo(
-                    QString::fromUtf8(current->path.c_str())).fileName();
+                const QString name = current->name;
                 viewport_.RemoveStl(id);
                 RefreshModelList();
                 UpdateProjectState();
@@ -950,6 +1132,10 @@ void SceneEditorWindow::UpdateModelSelection(bool force)
 {
     const auto* current = viewport_.CurrentModelInfo();
     const auto details_id = current && current->selected ? current->id : 0;
+    const bool can_duplicate = details_id != 0 && !viewport_.IsTransformEditing();
+    duplicate_action_->setEnabled(can_duplicate);
+    array_action_->setEnabled(can_duplicate);
+    place_on_plate_action_->setEnabled(can_duplicate);
     const auto transform_revision = current && current->selected ? current->transform_revision : 0;
     const auto state_revision = viewport_.ModelStateRevision();
     if (!force && state_revision == last_model_state_revision_)
@@ -988,13 +1174,19 @@ void SceneEditorWindow::UpdateModelSelection(bool force)
         bounds->setText(info.bounding_box_visible ? QStringLiteral("隐藏包围盒") : QStringLiteral("显示包围盒"));
         bounds->setToolTip(info.bounding_box_visible ? QStringLiteral("隐藏模型包围盒") : QStringLiteral("显示模型包围盒"));
         bounds->setChecked(info.bounding_box_visible);
-        row->findChild<QLabel*>(QStringLiteral("modelRowName"))->setEnabled(info.visible);
+        item->setText(info.name);
+        auto* name_label = row->findChild<QLabel*>(QStringLiteral("modelRowName"));
+        name_label->setText(info.name);
+        QPalette name_palette = name_label->palette();
+        name_palette.setColor(QPalette::WindowText, model_list_->palette().color(
+            info.visible ? QPalette::Active : QPalette::Disabled, QPalette::Text));
+        name_label->setPalette(name_palette);
         QPalette palette = row->palette();
         palette.setColor(QPalette::Window, info.selected ? QColor(214, 234, 255)
             : model_list_->palette().color(QPalette::Base));
         row->setPalette(palette);
     }
-    if (force || details_id != last_details_model_id_)
+    if (force || details_id != last_details_model_id_ || (details_id && model_name_label_->text() != current->name))
         UpdateModelDetails();
     else if (details_id && transform_revision != last_transform_revision_)
         UpdateModelTransformDetails();
@@ -1033,14 +1225,15 @@ void SceneEditorWindow::UpdateModelDetails()
 
     const QString path = QString::fromUtf8(info->path.c_str());
     const QFileInfo file(path);
-    model_name_label_->setText(file.fileName());
-    model_name_label_->setToolTip(file.fileName());
+    model_name_label_->setText(info->name);
+    model_name_label_->setToolTip(info->name);
     model_path_edit_->setPlainText(QDir::toNativeSeparators(file.absoluteFilePath()));
     model_path_edit_->setToolTip(model_path_edit_->toPlainText());
     model_file_size_label_->setText(FormatFileSize(static_cast<qint64>(info->source_file_size)));
     model_triangles_label_->setText(
         QLocale().toString(static_cast<qulonglong>(info->triangle_count)));
     UpdateModelTransformDetails();
+    UpdateModelTransformDialog();
 }
 
 void SceneEditorWindow::UpdateModelTransformDetails()
@@ -1069,6 +1262,75 @@ void SceneEditorWindow::UpdateModelTransformDetails()
     update_vector(model_translation_labels_, info->local_translation_mm);
     update_vector(model_scale_labels_, info->local_scale);
     update_vector(model_rotation_labels_, info->local_rotation_degrees);
+}
+
+bool SceneEditorWindow::eventFilter(QObject* object, QEvent* event)
+{
+    if (event->type() == QEvent::MouseButtonDblClick &&
+        static_cast<QMouseEvent*>(event)->button() == Qt::LeftButton)
+    {
+        const QVariant id = object->property("modelId");
+        if (id.isValid())
+        {
+            RenameModel(id.toULongLong());
+            return true;
+        }
+    }
+    return QMainWindow::eventFilter(object, event);
+}
+
+void SceneEditorWindow::RenameModel(std::uint64_t id)
+{
+    const auto* info = viewport_.ModelInfo(id);
+    if (!info) return;
+    const QString initial_name = info->name;
+    RenderPause pause(render_timer_, viewport_);
+    QDialog dialog(this);
+    dialog.setObjectName(QStringLiteral("renameModelDialog"));
+    dialog.setWindowTitle(QStringLiteral("修改模型名称"));
+    dialog.setWindowFlag(Qt::WindowContextHelpButtonHint, false);
+    dialog.setFont(QFont(QStringLiteral("Microsoft YaHei"), 11));
+    dialog.setMinimumWidth(480);
+    auto* layout = new QVBoxLayout(&dialog);
+    layout->setContentsMargins(22, 20, 22, 20);
+    layout->setSpacing(14);
+    auto* form = new QFormLayout;
+    auto* name = new QLineEdit(initial_name, &dialog);
+    name->setObjectName(QStringLiteral("modelNameEdit"));
+    name->setMaxLength(ModelNames::kMaxLength);
+    name->setMinimumHeight(34);
+    form->addRow(QStringLiteral("模型名称"), name);
+    layout->addLayout(form);
+    auto* hint = new QLabel(QStringLiteral("名称不能为空，且不能重名。"), &dialog);
+    hint->setObjectName(QStringLiteral("modelNameHint"));
+    hint->setTextFormat(Qt::PlainText);
+    hint->setWordWrap(true);
+    layout->addWidget(hint);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    auto* apply = buttons->button(QDialogButtonBox::Ok);
+    apply->setObjectName(QStringLiteral("renameModelButton"));
+    apply->setText(QStringLiteral("确定"));
+    buttons->button(QDialogButtonBox::Cancel)->setText(QStringLiteral("取消"));
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, [&]()
+    {
+        QString error;
+        if (!viewport_.RenameModel(id, name->text(), error))
+        {
+            hint->setText(error);
+            name->setFocus();
+            name->selectAll();
+            return;
+        }
+        dialog.accept();
+    });
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    layout->addWidget(buttons);
+    name->setFocus();
+    name->selectAll();
+    if (dialog.exec() != QDialog::Accepted) return;
+    UpdateModelSelection(true);
+    UpdateProjectState();
+    statusBar()->showMessage(QStringLiteral("模型名称：%1").arg(viewport_.ModelInfo(id)->name));
 }
 
 void SceneEditorWindow::OpenStl()

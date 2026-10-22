@@ -27,11 +27,19 @@ class StlModel
 public:
     using LocalTransform = ModelTransform;
 
-    void SetPlacementCenterMm(const glm::vec2& center_mm) { placement_center_mm_ = center_mm; }
+    void SetPlacementCenterMm(const glm::vec2& center_mm)
+    {
+        placement_center_mm_ = center_mm;
+        world_bounds_valid_ = false;
+    }
     glm::vec2 PlacementCenterMm() const { return placement_center_mm_; }
 
     const LocalTransform& Transform() const { return local_transform_; }
-    void SetTransform(const LocalTransform& transform) { local_transform_ = transform; }
+    void SetTransform(const LocalTransform& transform)
+    {
+        local_transform_ = transform;
+        world_bounds_valid_ = false;
+    }
 
     void SetTranslationXY(const glm::vec2& translation_mm)
     {
@@ -39,6 +47,7 @@ public:
         {
             local_transform_.translation_mm.x = translation_mm.x;
             local_transform_.translation_mm.y = translation_mm.y;
+            world_bounds_valid_ = false;
         }
     }
 
@@ -52,6 +61,7 @@ public:
 
     bool LoadFromMemory(const char* data, std::size_t size, std::string& error)
     {
+        world_bounds_valid_ = false;
         Assimp::Importer importer;
         const aiScene* scene = importer.ReadFileFromMemory(
             data, size,
@@ -223,18 +233,23 @@ public:
 
     void GetWorldBounds(glm::vec3& minimum, glm::vec3& maximum) const
     {
-        const glm::mat4 matrix = ModelMatrix();
-        minimum = glm::vec3(std::numeric_limits<float>::max());
-        maximum = glm::vec3(std::numeric_limits<float>::lowest());
-        for (int corner = 0; corner < 8; ++corner)
+        if (!world_bounds_valid_)
         {
-            const glm::vec3 point(corner & 1 ? bounds_max_.x : bounds_min_.x,
-                                  corner & 2 ? bounds_max_.y : bounds_min_.y,
-                                  corner & 4 ? bounds_max_.z : bounds_min_.z);
-            const glm::vec3 world(matrix * glm::vec4(point, 1.0f));
-            minimum = glm::min(minimum, world);
-            maximum = glm::max(maximum, world);
+            const glm::mat4 matrix = ModelMatrix();
+            world_bounds_min_ = glm::vec3(std::numeric_limits<float>::max());
+            world_bounds_max_ = glm::vec3(std::numeric_limits<float>::lowest());
+            // A rotated local box is conservative. Use actual vertices so the
+            // reported lowest point can touch the plate without a visible gap.
+            for (const auto& point : pick_vertices_)
+            {
+                const glm::vec3 world(matrix * glm::vec4(point, 1.0f));
+                world_bounds_min_ = glm::min(world_bounds_min_, world);
+                world_bounds_max_ = glm::max(world_bounds_max_, world);
+            }
+            world_bounds_valid_ = true;
         }
+        minimum = world_bounds_min_;
+        maximum = world_bounds_max_;
     }
 
     ~StlModel()
@@ -283,6 +298,9 @@ private:
     GLsizei vertex_count_ = 0;
     glm::vec3 bounds_min_{0.0f};
     glm::vec3 bounds_max_{0.0f};
+    mutable bool world_bounds_valid_ = false;
+    mutable glm::vec3 world_bounds_min_{0.0f};
+    mutable glm::vec3 world_bounds_max_{0.0f};
 };
 
 #endif

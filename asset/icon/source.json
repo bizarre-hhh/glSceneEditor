@@ -15,5 +15,7 @@
     "settings",
     "ruler"
   ],
+  "local_icons": ["duplicate-model.svg", "model-array.svg", "drop-to-plate.svg"],
+  "local_icons_note": "Project-authored SVG geometry matching the toolbar stroke color and viewBox.",
   "changes": "SVG stroke changed from currentColor to #334155 for Qt; geometry unchanged."
 }
