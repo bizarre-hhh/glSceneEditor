@@ -1,5 +1,6 @@
 #include <QAction>
 #include <QApplication>
+#include <QCheckBox>
 #include <QDialog>
 #include <QDoubleSpinBox>
 #include <QDataStream>
@@ -22,6 +23,7 @@
 #include <QToolButton>
 #include <QMessageBox>
 #include <QPushButton>
+#include <QSlider>
 #include <QSpinBox>
 #include <QTemporaryDir>
 #include <QTimer>
@@ -101,7 +103,11 @@ QByteArray LegacyProject(const ProjectData& project, quint32 version = 1)
         stream << quint8(1) << quint8(1);
     }
     if (version >= 3)
+    {
         stream << project.plate_size_mm.x << project.plate_size_mm.y;
+        if (version >= 5)
+            stream << project.plate_size_mm.z;
+    }
     stream << quint32(project.models.size());
     for (const auto& model : project.models)
     {
@@ -127,13 +133,13 @@ bool SameCamera(const Camera& a, const Camera& b)
         a.SceneRadius() == b.SceneRadius() && a.IsOrthographic() == b.IsOrthographic();
 }
 
-void ScrollViewport()
+void ScrollViewport(double y_offset = 3.0)
 {
     auto* window = glfwGetCurrentContext();
     auto callback = glfwSetScrollCallback(window, nullptr);
     glfwSetScrollCallback(window, callback);
     Require(callback != nullptr, "scroll callback missing");
-    callback(window, 0, 3);
+    callback(window, 0, y_offset);
 }
 
 int failures = 0;
@@ -246,19 +252,20 @@ void FileTests(const QString& directory)
         Require(SameProject(original, restored), "saved document differs");
         Require(restored.models[0].stl_data == stl, "embedded STL changed");
     });
-    Run("version 4 adds independent UTF-8 names without presentation fields", [&]()
+    Run("version 5 adds platform height and independent UTF-8 names", [&]()
     {
         const QByteArray bytes = ReadBytes(file);
         const QByteArray version3 = LegacyProject(original, 3);
         int name_bytes = 0;
         for (const auto& model : original.models) name_bytes += 4 + model.name.toUtf8().size();
-        Require(static_cast<unsigned char>(bytes[4]) == 4, "new format version missing");
-        Require(bytes.size() - version3.size() == name_bytes, "unexpected serialized fields");
+        Require(static_cast<unsigned char>(bytes[4]) == 5, "new format version missing");
+        Require(bytes.size() - version3.size() == 4 + name_bytes,
+                "unexpected serialized fields");
     });
     Run("version 3 preserves placement and derives distinct names for repeated paths", [&]()
     {
         ProjectData sized = original;
-        sized.plate_size_mm = {225, 175};
+        sized.plate_size_mm = {225, 175, 100};
         sized.models[1].placement_center_mm = {112.5f, 87.5f};
         const QString path = directory + "/version3.glproj";
         WriteBytes(path, LegacyProject(sized, 3));
@@ -277,7 +284,7 @@ void FileTests(const QString& directory)
     Run("platform dimensions and independent model placement survive file roundtrip", [&]()
     {
         ProjectData sized = original;
-        sized.plate_size_mm = {250.75f, 160.5f};
+        sized.plate_size_mm = {250.75f, 160.5f, 42.25f};
         sized.models[1].placement_center_mm = {125.375f, 80.25f};
         const QString path = directory + "/sized.glproj";
         Require(ProjectFile::Write(path, sized, error), qPrintable(error));
@@ -312,12 +319,12 @@ void FileTests(const QString& directory)
             Require(SameProject(previous, original), "failed read replaced document");
         }
         QByteArray invalid = bytes;
-        invalid[4] = 5; // Unsupported format version.
+        invalid[4] = 6; // Unsupported format version.
         WriteBytes(directory + "/bad.glproj", invalid);
         ProjectData previous = original;
         Require(!ProjectFile::Read(directory + "/bad.glproj", previous, error), "newer version accepted");
         invalid = bytes;
-        for (int i = 20; i < 24; ++i) // First path's byte length after dimensions and model count.
+        for (int i = 24; i < 28; ++i) // First path's byte length after dimensions and model count.
             invalid[i] = static_cast<char>(0xff);
         WriteBytes(directory + "/bad.glproj", invalid);
         Require(!ProjectFile::Read(directory + "/bad.glproj", previous, error), "oversized length accepted");
@@ -336,6 +343,9 @@ void FileTests(const QString& directory)
         Require(!ProjectFile::Write(file, invalid, error), "invalid platform accepted");
         Require(ReadBytes(file) == before, "invalid platform overwrote existing project");
         invalid = original;
+        invalid.plate_size_mm.z = std::numeric_limits<float>::quiet_NaN();
+        Require(!ProjectFile::Write(file, invalid, error), "invalid platform height accepted");
+        invalid = original;
         invalid.models[0].placement_center_mm.y = std::numeric_limits<float>::quiet_NaN();
         Require(!ProjectFile::Write(file, invalid, error), "invalid placement accepted");
         invalid = original;
@@ -350,6 +360,70 @@ void SceneTests(const QString& directory)
 {
     SceneViewport viewport;
     Require(viewport.Initialize(), "initialize hidden OpenGL viewport");
+    Run("perspective wheel zoom keeps its rate while approaching the cursor surface", [&]()
+    {
+        Camera camera;
+        camera.SetRotation(-90.0f, 35.0f);
+        camera.SetTarget({5.0f, 5.0f, 3.0f});
+        camera.SetDistance(30.0f);
+        const glm::vec3 anchor(5.0f, 5.0f, 0.0f);
+        float previous = glm::length(camera.Position() - anchor);
+        float previous_distance = camera.Distance();
+        for (int step = 1; step <= 20; ++step)
+        {
+            camera.DollyTowards(1.0f, anchor);
+            const float distance = glm::length(camera.Position() - anchor);
+            Require(std::abs(distance - previous * 0.85f) <= previous * 1.0e-3f,
+                    "perspective zoom slowed down instead of approaching the surface");
+            Require(std::abs(camera.Distance() - previous_distance * 0.85f) <=
+                    previous_distance * 1.0e-3f, "zoom distance used a different step");
+            previous = distance;
+            previous_distance = camera.Distance();
+        }
+    });
+    Run("wheel zoom out stops shortly after the Home framing", [&]()
+    {
+        viewport.ResetView();
+        const float home = viewport.GetCamera().Distance();
+        ScrollViewport(-1.0);
+        Require(viewport.GetCamera().Distance() > home, "wheel did not zoom out");
+        for (int step = 0; step < 32; ++step)
+            ScrollViewport(-1.0);
+        const float limit = viewport.GetCamera().Distance();
+        Require(limit > home * 1.2f && limit < home * 2.0f,
+                "zoom-out limit is not close to the Home framing");
+        ScrollViewport(-1.0);
+        Require(viewport.GetCamera().Distance() == limit,
+                "zoom out continued past the limit");
+        viewport.ResetView();
+    });
+    Run("pan uses the grabbed surface depth", [&]()
+    {
+        Camera camera;
+        camera.SetRotation(-90.0f, 35.0f);
+        camera.SetTarget({5.0f, 5.0f, 3.0f});
+        camera.SetDistance(30.0f);
+        constexpr float aspect = 16.0f / 9.0f;
+        constexpr int height = 800;
+        const glm::vec3 anchor(5.0f, 5.0f, 0.0f);
+        const auto to_screen = [&](const glm::mat4& view_projection,
+                                   const glm::vec3& point)
+        {
+            const glm::vec4 clip = view_projection * glm::vec4(point, 1.0f);
+            return glm::vec2((clip.x / clip.w * 0.5f + 0.5f) * aspect * height,
+                             (0.5f - clip.y / clip.w * 0.5f) * height);
+        };
+        const glm::vec3 forward =
+            glm::normalize(camera.Target() - camera.Position());
+        const float depth = glm::dot(anchor - camera.Position(), forward);
+        const glm::vec2 before = to_screen(
+            camera.GetProjectionMatrix(aspect) * camera.GetViewMatrix(), anchor);
+        camera.Pan(120.0f, -75.0f, depth, height);
+        const glm::vec2 after = to_screen(
+            camera.GetProjectionMatrix(aspect) * camera.GetViewMatrix(), anchor);
+        Require(glm::length(after - before - glm::vec2(120.0f, -75.0f)) < 1.0f,
+                "pan did not follow the mouse at the grabbed surface");
+    });
     QString error;
     std::string load_error;
     glm::vec3 size;
@@ -622,6 +696,38 @@ void TransformTests(const QString& directory)
         transform.rotation_degrees.x = std::numeric_limits<float>::infinity();
         Require(!viewport.TransformModelTo(id, transform, TransformMode::Rotate), "invalid rotation accepted");
         Require(viewport.HistoryRevision() == history && SameProject(saved, viewport.SnapshotProject()), "invalid transform changed scene");
+    });
+    Run("translation is limited to one platform size beyond either edge", [&]()
+    {
+        const auto id = load();
+        const glm::vec3 start = viewport.ModelInfo(id)->world_position_mm;
+        // Default platform is 100 x 100 x 100 mm, so each axis allows
+        // positions from -100 to 200 mm.
+        const glm::vec3 positive(200.0f);
+        const glm::vec3 negative(-100.0f);
+        Require(vectors_close(start, {50.0f, 50.0f, 15.0f}), "unexpected cube placement");
+        Require(viewport.MoveModelTo(id, positive - start), "move to positive limit");
+        Require(vectors_close(viewport.ModelInfo(id)->world_position_mm, positive),
+                "positive limit not reached");
+        const auto history = viewport.HistoryRevision();
+        Require(!viewport.MoveModelTo(id, positive - start + glm::vec3(1.0f, 0.0f, 0.0f)),
+                "positive limit exceeded");
+        Require(vectors_close(viewport.ModelInfo(id)->world_position_mm, positive) &&
+                viewport.HistoryRevision() == history,
+                "rejected positive move changed state");
+        Require(viewport.MoveModelTo(id, negative - start), "move to negative limit");
+        Require(vectors_close(viewport.ModelInfo(id)->world_position_mm, negative),
+                "negative limit not reached");
+        Require(!viewport.MoveModelTo(id, negative - start - glm::vec3(0.0f, 0.0f, 1.0f)),
+                "negative limit exceeded");
+        Require(vectors_close(viewport.ModelInfo(id)->world_position_mm, negative),
+                "rejected negative move changed position");
+        auto matrix = *viewport.ModelGizmoMatrix(id);
+        matrix[3] += glm::vec4(1000.0f, 0.0f, 0.0f, 0.0f);
+        Require(!viewport.TransformModelFromGizmo(id, matrix, TransformMode::Translate),
+                "gizmo translation past the limit accepted");
+        Require(vectors_close(viewport.ModelInfo(id)->world_position_mm, negative),
+                "rejected gizmo translation changed position");
     });
     Run("editing session freezes selection of every model and unlocks without changing history", [&]()
     {
@@ -1328,8 +1434,9 @@ void PlateTests(const QString& directory)
         original_id = original.id;
         Require(viewport.RenderFrame(), "render default platform");
         const float before_distance = viewport.GetCamera().Distance();
-        Require(viewport.SetPlateSizeMm({245.5f, 125.25f}, error), qPrintable(error));
-        Require(viewport.PlateSizeMm() == glm::vec2(245.5f, 125.25f), "rectangle dimensions incorrect");
+        Require(viewport.SetPlateSizeMm({245.5f, 125.25f, 80.0f}, error), qPrintable(error));
+        Require(viewport.PlateSizeMm() == glm::vec3(245.5f, 125.25f, 80.0f),
+                "rectangle dimensions incorrect");
         const auto* same = viewport.ModelInfo(original_id);
         Require(same->world_bounds_min_mm == original.world_bounds_min_mm &&
                 same->world_bounds_max_mm == original.world_bounds_max_mm &&
@@ -1347,7 +1454,8 @@ void PlateTests(const QString& directory)
     Run("platform changes coexist with import Undo and Redo", [&]()
     {
         Require(viewport.Undo(error) && viewport.ModelCount() == 1, "undo later import");
-        Require(viewport.Undo(error) && viewport.PlateSizeMm() == glm::vec2(100), "undo platform resize");
+        Require(viewport.Undo(error) &&
+                viewport.PlateSizeMm() == glm::vec3(100), "undo platform resize");
         Require(viewport.ModelInfo(original_id)->world_bounds_min_mm == positions[0].world_bounds_min_mm,
                 "platform Undo moved model");
         Require(viewport.Redo(error) && viewport.PlateSizeMm() == saved.plate_size_mm, "redo platform resize");
@@ -1358,7 +1466,8 @@ void PlateTests(const QString& directory)
         const QString path = directory + "/platform_scene.glproj";
         Require(ProjectFile::Write(path, saved, error), qPrintable(error));
         viewport.NewProject();
-        Require(viewport.PlateSizeMm() == glm::vec2(100) && !viewport.CanUndo(), "New kept platform or history");
+        Require(viewport.PlateSizeMm() == glm::vec3(100) && !viewport.CanUndo(),
+                "New kept platform or history");
         ProjectData loaded;
         Require(ProjectFile::Read(path, loaded, error) && viewport.ApplyProject(loaded, error), qPrintable(error));
         Require(SameProject(saved, viewport.SnapshotProject()), "sized scene not restored");
@@ -1376,21 +1485,24 @@ void PlateTests(const QString& directory)
     {
         const auto before = viewport.SnapshotProject();
         const auto history = viewport.HistoryRevision();
-        for (const glm::vec2 invalid : {glm::vec2(0, 100), glm::vec2(-1, 100),
-             glm::vec2(10001, 100), glm::vec2(std::numeric_limits<float>::quiet_NaN(), 100)})
-            Require(!viewport.SetPlateSizeMm(invalid, error), "invalid platform dimensions accepted");
+        for (const glm::vec3 invalid : {glm::vec3(0, 100, 100), glm::vec3(-1, 100, 100),
+             glm::vec3(10001, 100, 100), glm::vec3(100, 100, 0),
+             glm::vec3(100, 100, std::numeric_limits<float>::quiet_NaN())})
+            Require(!viewport.SetPlateSizeMm(invalid, error),
+                    "invalid platform dimensions accepted");
         Require(viewport.SetPlateSizeMm(before.plate_size_mm, error), "unchanged platform failed");
         Require(SameProject(before, viewport.SnapshotProject()) && viewport.HistoryRevision() == history,
                 "invalid or unchanged dimensions altered scene/history");
         ProjectData corrupt = before;
-        corrupt.plate_size_mm = {300, 180};
+        corrupt.plate_size_mm = {300, 180, 60};
         corrupt.models[0].stl_data = "broken STL";
         Require(!viewport.ApplyProject(corrupt, error), "bad resized project accepted");
         Require(SameProject(before, viewport.SnapshotProject()), "failed Open changed current platform");
     });
     Run("minimum and maximum platform sizes rebuild and render repeatedly", [&]()
     {
-        for (const glm::vec2 dimensions : {glm::vec2(10000, 300), glm::vec2(1, 1), glm::vec2(120, 80)})
+        for (const glm::vec3 dimensions : {glm::vec3(10000, 300, 100),
+             glm::vec3(1, 1, 10000), glm::vec3(120, 80, 35)})
         {
             Require(viewport.SetPlateSizeMm(dimensions, error), qPrintable(error));
             Require(viewport.RenderFrame(), "render size boundary");
@@ -1478,11 +1590,20 @@ void UiTests(const QString& directory)
         {
             auto* length = dialog->findChild<QDoubleSpinBox*>("plateLengthSpinBox");
             auto* width = dialog->findChild<QDoubleSpinBox*>("plateWidthSpinBox");
-            fields_correct = length && width && length->value() == 100 && width->value() == 100;
-            if (length && width) { length->setValue(200); width->setValue(150); }
+            auto* height = dialog->findChild<QDoubleSpinBox*>("plateHeightSpinBox");
+            fields_correct = length && width && height &&
+                length->value() == 100 && width->value() == 100 &&
+                height->value() == 100;
+            if (length && width && height)
+            {
+                length->setValue(200);
+                width->setValue(150);
+                height->setValue(80);
+            }
             dialog->reject();
         }, [&]() { Trigger(window, "plateSizeAction"); });
-        Require(fields_correct && viewport.PlateSizeMm() == glm::vec2(100) && viewport.HistoryRevision() == history,
+        Require(fields_correct && viewport.PlateSizeMm() == glm::vec3(100) &&
+                viewport.HistoryRevision() == history,
                 "platform Cancel changed dimensions/history");
     });
     Run("first Save asks destination and writes current scene", [&]()
@@ -1503,18 +1624,26 @@ void UiTests(const QString& directory)
         {
             auto* length = dialog->findChild<QDoubleSpinBox*>("plateLengthSpinBox");
             auto* width = dialog->findChild<QDoubleSpinBox*>("plateWidthSpinBox");
-            fields_found = length && width;
-            if (fields_found) { length->setValue(150.75); width->setValue(90.25); }
+            auto* height = dialog->findChild<QDoubleSpinBox*>("plateHeightSpinBox");
+            fields_found = length && width && height;
+            if (fields_found)
+            {
+                length->setValue(150.75);
+                width->setValue(90.25);
+                height->setValue(75.5);
+            }
             dialog->accept();
         }, [&]() { Trigger(window, "plateSizeAction"); });
-        Require(fields_found && viewport.PlateSizeMm() == glm::vec2(150.75f, 90.25f) &&
+        Require(fields_found &&
+                viewport.PlateSizeMm() == glm::vec3(150.75f, 90.25f, 75.5f) &&
                 window.isWindowModified() && viewport.HistoryRevision() == history + 1, "platform edit not applied/recorded");
         Trigger(window, "saveProjectAction");
         ProjectData stored;
         Require(ProjectFile::Read(first, stored, error) && stored.plate_size_mm == viewport.PlateSizeMm() &&
                 !window.isWindowModified(), "Save did not acknowledge and store dimensions");
         Trigger(window, "undoAction");
-        Require(viewport.PlateSizeMm() == glm::vec2(100) && window.isWindowModified(), "platform Undo did not require Save");
+        Require(viewport.PlateSizeMm() == glm::vec3(100) && window.isWindowModified(),
+                "platform Undo did not require Save");
         Trigger(window, "redoAction");
         Require(viewport.PlateSizeMm() == stored.plate_size_mm, "platform Redo not restored");
         Trigger(window, "saveProjectAction");
@@ -1588,26 +1717,27 @@ void UiTests(const QString& directory)
     {
         Require(viewport.LoadStl(model.toUtf8().toStdString(), load_error, size), load_error.c_str());
         // One timer handles both successive modal dialogs in the action's event loops.
-        bool chose_file = false, chose_save = false;
+        // Open asks to save first, then presents the project picker.
+        bool chose_save = false, chose_file = false;
         QTimer responder;
         responder.setInterval(10);
         QObject::connect(&responder, &QTimer::timeout, [&]()
         {
-            if (!chose_file)
+            if (!chose_save)
+            {
+                if (auto* box = qobject_cast<QMessageBox*>(QApplication::activeModalWidget()))
+                {
+                    chose_save = true;
+                    box->button(QMessageBox::Save)->click();
+                }
+            }
+            else if (!chose_file)
             {
                 if (auto* file = qobject_cast<QFileDialog*>(QApplication::activeModalWidget()))
                 {
                     chose_file = true;
                     file->selectFile(first);
                     QMetaObject::invokeMethod(file, "accept", Qt::QueuedConnection);
-                }
-            }
-            else if (!chose_save)
-            {
-                if (auto* box = qobject_cast<QMessageBox*>(QApplication::activeModalWidget()))
-                {
-                    chose_save = true;
-                    box->button(QMessageBox::Save)->click();
                     responder.stop();
                 }
             }
@@ -2082,6 +2212,164 @@ void UiTests(const QString& directory)
         Trigger(window, "duplicateModelsAction");
         Require(label(2)->text() == QStringLiteral("隐藏打印件 (2)"), "UI copy shares source name");
     });
+    Run("slice menu generates a contour and fill preview without dirtying the project", [&]()
+    {
+        viewport.EndTransformEditing();
+        viewport.NewProject();
+        WithFile(model, [&]() { Trigger(window, "openStlAction"); });
+        const auto history = viewport.HistoryRevision();
+        const bool was_modified = window.isWindowModified();
+        const auto id = viewport.ModelInfos()[0].id;
+        viewport.SetModelVisible(id, false); // hidden models still participate
+
+        bool fields_found = false;
+        WithDialog([&](QDialog* dialog)
+        {
+            Require(dialog->objectName() == QStringLiteral("sliceSettingsDialog"),
+                    "wrong slice dialog");
+            auto* thickness = dialog->findChild<QDoubleSpinBox*>(
+                QStringLiteral("sliceLayerThicknessSpin"));
+            auto* hatch_enabled = dialog->findChild<QCheckBox*>(
+                QStringLiteral("sliceHatchEnabledCheck"));
+            auto* spacing = dialog->findChild<QDoubleSpinBox*>(
+                QStringLiteral("sliceHatchSpacingSpin"));
+            auto* angle = dialog->findChild<QDoubleSpinBox*>(
+                QStringLiteral("sliceHatchAngleSpin"));
+            auto* increment = dialog->findChild<QDoubleSpinBox*>(
+                QStringLiteral("sliceHatchLayerIncrementSpin"));
+            Require(thickness && hatch_enabled && spacing && angle && increment,
+                    "slice dialog fields missing");
+            Require(hatch_enabled->isChecked(), "fill not enabled by default");
+            Require(std::abs(spacing->value() - 0.08) < 1.0e-6,
+                    "default hatch spacing");
+            Require(std::abs(angle->value() - 45.0) < 1.0e-6,
+                    "default hatch angle");
+            Require(std::abs(increment->value() - 67.0) < 1.0e-6,
+                    "default hatch layer increment");
+            thickness->setValue(1.0);
+            fields_found = true;
+            dialog->accept();
+        }, [&]() { Trigger(window, "generateSliceAction"); });
+
+        Require(fields_found, "slice settings dialog was not presented");
+        const auto info = viewport.SliceInfo();
+        Require(info.has_preview && info.layer_count == 30,
+                "slice preview did not generate 30 layers");
+        Require(info.hatch.enabled && info.hatch_count > 0 &&
+                info.layer_hatch_path_length_mm > 0.0,
+                "slice preview has no fill lines");
+        Require(viewport.HistoryRevision() == history &&
+                window.isWindowModified() == was_modified,
+                "slicing changed project state");
+        auto* dock = window.findChild<QDockWidget*>("slicePreviewDock");
+        auto* label = window.findChild<QLabel*>("sliceLayerLabel");
+        auto* hatch_label = window.findChild<QLabel*>("sliceHatchLabel");
+        auto* settings_label =
+            window.findChild<QLabel*>("sliceHatchSettingsLabel");
+        auto* contour_check =
+            window.findChild<QCheckBox*>("sliceContourVisibleCheck");
+        auto* hatch_check =
+            window.findChild<QCheckBox*>("sliceHatchVisibleCheck");
+        auto* direction_check =
+            window.findChild<QCheckBox*>("sliceDirectionVisibleCheck");
+        auto* jump_check =
+            window.findChild<QCheckBox*>("sliceJumpVisibleCheck");
+        auto* hide_models_check =
+            window.findChild<QCheckBox*>("sliceHideModelsCheck");
+        auto* jump_label = window.findChild<QLabel*>("sliceJumpLabel");
+        auto* clear = window.findChild<QAction*>("clearSliceAction");
+        Require(dock && !dock->isHidden(), "slice dock was not shown");
+        Require(label && label->text().contains(QStringLiteral("第 1 / 30")),
+                "slice layer label is wrong");
+        Require(hatch_label && hatch_label->text().contains(QStringLiteral("本层填充")),
+                "slice hatch label is wrong");
+        Require(settings_label && settings_label->text().contains(QStringLiteral("0.08")),
+                "slice hatch settings label is wrong");
+        Require(jump_label && jump_label->text().contains(QStringLiteral("本层跳转")),
+                "slice jump label is wrong");
+        Require(info.jump_count > 0 && info.layer_jump_path_length_mm > 0.0,
+                "slice preview has no jump data");
+        Require(contour_check && contour_check->isChecked(),
+                "contour visibility is off by default");
+        Require(hatch_check && hatch_check->isChecked(),
+                "hatch visibility is off by default");
+        Require(direction_check && !direction_check->isChecked(),
+                "direction visibility is on by default");
+        Require(jump_check && !jump_check->isChecked(),
+                "jump visibility is on by default");
+        Require(hide_models_check && !hide_models_check->isChecked() &&
+                hide_models_check->isEnabled(),
+                "hide models checkbox default state");
+        Require(clear && clear->isEnabled(), "clear slice action is disabled");
+
+        hatch_check->click();
+        Require(!viewport.SliceInfo().hatches_visible,
+                "hatch visibility toggle did not hide fills");
+        hatch_check->click();
+        Require(viewport.SliceInfo().hatches_visible,
+                "hatch visibility toggle did not restore fills");
+        contour_check->click();
+        Require(!viewport.SliceInfo().contours_visible,
+                "contour visibility toggle did not hide contours");
+        contour_check->click();
+        Require(viewport.SliceInfo().contours_visible,
+                "contour visibility toggle did not restore contours");
+
+        jump_check->click();
+        Require(viewport.SliceInfo().jumps_visible,
+                "jump visibility toggle did not enable jumps");
+        jump_check->click();
+        Require(!viewport.SliceInfo().jumps_visible,
+                "jump visibility toggle did not disable jumps");
+
+        hide_models_check->click();
+        Require(viewport.ModelsHidden() &&
+                viewport.SliceInfo().models_hidden,
+                "hide models toggle did not hide models");
+        Require(viewport.SliceInfo().has_preview,
+                "hiding models removed the slice preview");
+        hide_models_check->click();
+        Require(!viewport.ModelsHidden(),
+                "hide models toggle did not restore models");
+
+        direction_check->click();
+        Require(viewport.SliceInfo().direction_visible,
+                "direction visibility toggle did not enable arrows");
+        hatch_check->click();
+        Require(!direction_check->isEnabled(),
+                "direction checkbox enabled while fills are hidden");
+        Require(jump_check->isEnabled(),
+                "jump checkbox disabled while fills are hidden");
+        hatch_check->click();
+        Require(direction_check->isEnabled(),
+                "direction checkbox not restored when fills are visible");
+        direction_check->click();
+        Require(!viewport.SliceInfo().direction_visible,
+                "direction visibility toggle did not disable arrows");
+
+        SceneViewport::SliceEstimate estimate;
+        SliceSettings tight;
+        tight.layer_thickness_mm = 0.001;
+        Require(!viewport.PrepareSlice(tight, estimate, error) &&
+                error.contains(QStringLiteral("预计层数超过")),
+                "slice layer cap was not enforced");
+
+        viewport.SetModelVisible(id, true);
+        viewport.SetModelSelected(id, true);
+        Require(viewport.BeginModelMove(id), "begin slice invalidation move");
+        Require(viewport.MoveModelTo(id, {5.0f, 0.0f, 0}), "slice invalidation move");
+        viewport.EndModelMove();
+        Require(viewport.RenderFrame(), "render after slice invalidation");
+        Require(!viewport.SliceInfo().has_preview, "slice preview was not invalidated");
+        Require(viewport.ConsumeSliceInvalidation(), "slice invalidation was not reported");
+
+        Require(viewport.SetPlateSizeMm({40, 40, 100}, error), qPrintable(error));
+        SliceSettings normal;
+        normal.layer_thickness_mm = 1.0;
+        Require(!viewport.PrepareSlice(normal, estimate, error) &&
+                error.contains(QStringLiteral("超出平台范围")),
+                "out-of-bounds slice was accepted");
+    });
     qApp->removeEventFilter(&filter);
 }
 } // namespace
@@ -2121,6 +2409,7 @@ int main(int argc, char* argv[])
                      capture_mode == QStringLiteral("--capture-rename") ||
                      capture_mode == QStringLiteral("--capture-array-dialog") ||
                      capture_mode == QStringLiteral("--capture-array-view") ||
+                     capture_mode == QStringLiteral("--capture-slice") ||
                      capture_mode == QStringLiteral("--capture-model-transform") ||
                      capture_mode.startsWith(QStringLiteral("--capture-gizmo-"))))
     {
@@ -2144,7 +2433,7 @@ int main(int argc, char* argv[])
             viewport.NewProject();
             Require(viewport.LoadStl(TEST_ASSET_DIR "/cube_30mm.stl", load_error, size), "array preview import");
             viewport.SetModelSelected(viewport.ModelInfos()[0].id, true);
-            Require(viewport.SetPlateSizeMm({160, 130}, error) && viewport.ArraySelectedModels(2, 3, {5, 8}, error), "array preview generate");
+            Require(viewport.SetPlateSizeMm({160, 130, 100}, error) && viewport.ArraySelectedModels(2, 3, {5, 8}, error), "array preview generate");
             viewport.ResetView();
             Require(viewport.RenderFrame() && viewport.RenderFrame(), "array preview render");
             const auto& io = ImGui::GetIO();
@@ -2193,6 +2482,118 @@ int main(int argc, char* argv[])
             Require(dock && dock->grab().save(QString::fromLocal8Bit(argv[2]) + ".dock.png"), "capture transform buttons");
             dialog->reject();
         }
+        else if (capture_mode == QStringLiteral("--capture-slice"))
+        {
+            window.resize(1800, 1000);
+            window.show();
+            app.processEvents();
+            bool fields_found = false;
+            WithDialog([&](QDialog* dialog)
+            {
+                auto* thickness = dialog->findChild<QDoubleSpinBox*>(
+                    QStringLiteral("sliceLayerThicknessSpin"));
+                auto* spacing = dialog->findChild<QDoubleSpinBox*>(
+                    QStringLiteral("sliceHatchSpacingSpin"));
+                fields_found = thickness != nullptr;
+                if (thickness)
+                    thickness->setValue(1.0);
+                if (spacing)
+                    spacing->setValue(0.5);
+                dialog->accept();
+            }, [&]() { Trigger(window, "generateSliceAction"); });
+            Require(fields_found, "slice capture dialog fields");
+            auto* slider = window.findChild<QSlider*>("sliceLayerSlider");
+            Require(slider && slider->maximum() > 1, "slice capture slider");
+            slider->setValue(slider->maximum() / 2);
+            viewport.ResetView();
+            Require(viewport.RenderFrame() && viewport.RenderFrame(), "slice capture render");
+            const auto& io = ImGui::GetIO();
+            const int width = static_cast<int>(io.DisplaySize.x * io.DisplayFramebufferScale.x);
+            const int height = static_cast<int>(io.DisplaySize.y * io.DisplayFramebufferScale.y);
+            QImage pixels(width, height, QImage::Format_RGBA8888);
+            glReadBuffer(GL_FRONT);
+            glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels.bits());
+            Require(pixels.mirrored().save(QString::fromLocal8Bit(argv[2])), "capture slice view");
+            auto* hatch_check = window.findChild<QCheckBox*>(
+                QStringLiteral("sliceHatchVisibleCheck"));
+            if (hatch_check)
+            {
+                hatch_check->setChecked(false);
+                Require(viewport.RenderFrame() && viewport.RenderFrame(),
+                        "slice contour capture render");
+                QImage contours(width, height, QImage::Format_RGBA8888);
+                glReadBuffer(GL_FRONT);
+                glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE,
+                             contours.bits());
+                Require(contours.mirrored().save(
+                            QString::fromLocal8Bit(argv[2]) + ".contours.png"),
+                        "capture slice contours");
+                hatch_check->setChecked(true);
+                viewport.RenderFrame();
+            }
+            auto* direction_check = window.findChild<QCheckBox*>(
+                QStringLiteral("sliceDirectionVisibleCheck"));
+            auto* jump_check = window.findChild<QCheckBox*>(
+                QStringLiteral("sliceJumpVisibleCheck"));
+            if (direction_check && jump_check)
+            {
+                direction_check->setChecked(true);
+                jump_check->setChecked(true);
+                Require(viewport.RenderFrame() && viewport.RenderFrame(),
+                        "slice path capture render");
+                QImage path_view(width, height, QImage::Format_RGBA8888);
+                glReadBuffer(GL_FRONT);
+                glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE,
+                             path_view.bits());
+                Require(path_view.mirrored().save(
+                            QString::fromLocal8Bit(argv[2]) + ".path.png"),
+                        "capture slice path overlay");
+                direction_check->setChecked(false);
+                jump_check->setChecked(false);
+                viewport.RenderFrame();
+            }
+            auto* contour_check = window.findChild<QCheckBox*>(
+                QStringLiteral("sliceContourVisibleCheck"));
+            if (contour_check && hatch_check && jump_check)
+            {
+                contour_check->setChecked(false);
+                hatch_check->setChecked(false);
+                jump_check->setChecked(true);
+                Require(viewport.RenderFrame() && viewport.RenderFrame(),
+                        "slice jumps capture render");
+                QImage jumps(width, height, QImage::Format_RGBA8888);
+                glReadBuffer(GL_FRONT);
+                glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE,
+                             jumps.bits());
+                Require(jumps.mirrored().save(
+                            QString::fromLocal8Bit(argv[2]) + ".jumps.png"),
+                        "capture slice jumps");
+                jump_check->setChecked(false);
+                hatch_check->setChecked(true);
+                contour_check->setChecked(true);
+                viewport.RenderFrame();
+            }
+            auto* hide_models_check = window.findChild<QCheckBox*>(
+                QStringLiteral("sliceHideModelsCheck"));
+            if (hide_models_check)
+            {
+                hide_models_check->setChecked(true);
+                Require(viewport.RenderFrame() && viewport.RenderFrame(),
+                        "slice no-models capture render");
+                QImage no_models(width, height, QImage::Format_RGBA8888);
+                glReadBuffer(GL_FRONT);
+                glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE,
+                             no_models.bits());
+                Require(no_models.mirrored().save(
+                            QString::fromLocal8Bit(argv[2]) + ".no-models.png"),
+                        "capture slice without models");
+                hide_models_check->setChecked(false);
+                viewport.RenderFrame();
+            }
+            auto* dock = window.findChild<QDockWidget*>("slicePreviewDock");
+            Require(dock && dock->grab().save(QString::fromLocal8Bit(argv[2]) + ".dock.png"),
+                    "capture slice dock");
+        }
         else if (capture_mode == QStringLiteral("--capture-rename"))
         {
             Require(viewport.DuplicateSelectedModels(error), qPrintable(error));
@@ -2225,7 +2626,7 @@ int main(int argc, char* argv[])
         }
         else if (capture_mode == QStringLiteral("--capture-platform"))
         {
-            Require(viewport.SetPlateSizeMm({240, 160}, error), qPrintable(error));
+            Require(viewport.SetPlateSizeMm({240, 160, 100}, error), qPrintable(error));
             WithDialog([&](QDialog* dialog)
             {
                 Require(dialog->grab().save(QString::fromLocal8Bit(argv[2])), "capture platform size dialog");

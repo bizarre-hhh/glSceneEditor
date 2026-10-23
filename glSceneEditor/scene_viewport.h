@@ -7,14 +7,18 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
 #include <vector>
 
+#include <QStringList>
+
 #include "camera_controller.h"
 #include "project_file.h"
 #include "model_transform.h"
+#include "slice_engine.h"
 
 class BasePlate;
 class Shader;
@@ -51,6 +55,38 @@ public:
         std::size_t source_file_size = 0;
         glm::vec2 placement_center_mm{PlateDimensions::kDefaultMm * 0.5f};
         QString name;
+    };
+
+    struct SliceEstimate
+    {
+        std::size_t estimated_layers = 0;
+        std::size_t triangle_count = 0;
+        double max_z_mm = 0.0;
+    };
+
+    struct SlicePreviewInfo
+    {
+        bool has_preview = false;
+        bool visible = false;
+        bool contours_visible = false;
+        bool hatches_visible = false;
+        bool direction_visible = false;
+        bool jumps_visible = false;
+        bool models_hidden = false;
+        std::size_t layer_count = 0;
+        std::size_t layer_index = 0; // 1-based, 0 when no preview
+        double z_mm = 0.0;
+        std::size_t contour_count = 0;
+        std::size_t hatch_count = 0;
+        std::size_t jump_count = 0;
+        double layer_contour_path_length_mm = 0.0;
+        double layer_hatch_path_length_mm = 0.0;
+        double layer_jump_path_length_mm = 0.0;
+        double layer_path_length_mm = 0.0;
+        double total_contour_path_length_mm = 0.0;
+        double total_hatch_path_length_mm = 0.0;
+        double total_path_length_mm = 0.0;
+        HatchSettings hatch;
     };
 
     SceneViewport();
@@ -119,9 +155,29 @@ public:
     void RemoveStl() { RemoveStl(active_model_id_); }
     void RemoveStl(ModelId id);
 
-    glm::vec2 PlateSizeMm() const { return plate_size_mm_; }
-    bool SetPlateSizeMm(const glm::vec2& size_mm, QString& error);
+    glm::vec3 PlateSizeMm() const { return plate_size_mm_; }
+    bool SetPlateSizeMm(const glm::vec3& size_mm, QString& error);
     void ResetView();
+
+    // Slice preview: all models, current placement in mm.
+    bool PrepareSlice(const SliceSettings& settings, SliceEstimate& estimate,
+                      QString& error) const;
+    bool GenerateSlice(const SliceSettings& settings,
+                       const SliceProgressCallback& progress,
+                       bool& cancelled, QString& error, QStringList& issues);
+    void ClearSlicePreview();
+    void SetSlicePreviewVisible(bool visible);
+    void SetSliceContoursVisible(bool visible);
+    void SetSliceHatchesVisible(bool visible);
+    void SetSliceDirectionVisible(bool visible);
+    void SetSliceJumpsVisible(bool visible);
+    void SetModelsHidden(bool hidden);
+    bool ModelsHidden() const { return models_hidden_; }
+    bool SetSliceLayer(std::size_t index);
+    SlicePreviewInfo SliceInfo() const;
+    std::uint64_t SliceRevision() const { return slice_revision_; }
+    bool ConsumeSliceInvalidation();
+
     const Camera& GetCamera() const { return camera_controller_.GetCamera(); }
     void SetSettingsVisible(bool visible) { show_settings_ = visible; }
     void ReleaseGraphics(); // call before the Qt window destroys its wrapper
@@ -166,8 +222,8 @@ private:
         ModelId previous_active_id = 0;
         ModelTransform before_transform;
         ModelTransform after_transform;
-        glm::vec2 before_plate_size{PlateDimensions::kDefaultMm};
-        glm::vec2 after_plate_size{PlateDimensions::kDefaultMm};
+        glm::vec3 before_plate_size = PlateDimensions::DefaultSizeMm();
+        glm::vec3 after_plate_size = PlateDimensions::DefaultSizeMm();
         std::uint64_t before_revision = 0;
         std::uint64_t after_revision = 0;
         QString description;
@@ -191,6 +247,7 @@ private:
     void EraseModel(ModelId id);
     bool ApplyTransform(ModelEntry& entry, const ModelTransform& transform);
     bool ApplyTransforms(const std::vector<ModelTransformChange>& changes, bool forward);
+    bool IsModelPositionAllowed(const glm::vec3& position_mm) const;
     bool DrawModelGizmo(const glm::mat4& view, const glm::mat4& projection, bool over_cube);
     void RecordOperation(Operation operation);
     void AppendHistory(const QString& description);
@@ -200,7 +257,7 @@ private:
     const ModelEntry* FindModel(ModelId id) const;
     void ChooseActiveModel();
     void ResetProjectDisplay();
-    void ApplyPlateSizeMm(const glm::vec2& size_mm);
+    void ApplyPlateSizeMm(const glm::vec3& size_mm);
     void RefreshSceneBounds();
     struct MouseRay
     {
@@ -216,6 +273,8 @@ private:
     };
     std::optional<MouseRay> MouseRayAt(const glm::vec2& position,
                                      bool require_inside = true) const;
+    std::optional<glm::vec3> ClosestScenePoint(const MouseRay& ray) const;
+    std::optional<glm::vec3> ZoomAnchorAt(const glm::vec2& position) const;
     ModelEntry* ClosestModel(const MouseRay& ray, glm::vec3* hit_point);
     void BeginModelDrag(ModelId id, const glm::vec2& position, const glm::vec3& hit_point);
     void UpdateModelDrag(const glm::vec2& position);
@@ -223,6 +282,8 @@ private:
     glm::mat4 ProjectionMatrix(float aspect) const;
     void DrawSettings();
     void DrawModelBounds(const glm::mat4& view, const glm::mat4& projection);
+    void DrawSlicePreview(const glm::mat4& view, const glm::mat4& projection);
+    void UploadSliceLayer();
 
     GLFWwindow* window_ = nullptr;
     void* previous_ime_context_ = nullptr;
@@ -238,9 +299,32 @@ private:
     std::unique_ptr<Shader> stl_shader_;
     std::unique_ptr<Shader> plate_shader_;
     std::unique_ptr<BasePlate> base_plate_;
-    glm::vec2 plate_size_mm_{PlateDimensions::kDefaultMm};
+    glm::vec3 plate_size_mm_ = PlateDimensions::DefaultSizeMm();
     unsigned int bounds_vao_ = 0;
     unsigned int bounds_vbo_ = 0;
+    unsigned int slice_vao_ = 0;
+    unsigned int slice_vbo_ = 0;
+    int slice_contour_vertex_count_ = 0;
+    int slice_hatch_vertex_count_ = 0;
+    int slice_arrow_vertex_count_ = 0;
+    int slice_jump_vertex_count_ = 0;
+    std::size_t slice_jump_count_ = 0;
+    double slice_jump_path_length_mm_ = 0.0;
+    std::vector<SliceLayer> slice_layers_;
+    std::size_t slice_current_layer_ = 0; // 0-based
+    bool slice_visible_ = false;
+    bool slice_contours_visible_ = true;
+    bool slice_hatches_visible_ = true;
+    bool slice_direction_visible_ = false;
+    bool slice_jumps_visible_ = false;
+    bool models_hidden_ = false;
+    double slice_total_contour_path_length_mm_ = 0.0;
+    double slice_total_hatch_path_length_mm_ = 0.0;
+    double slice_total_path_length_mm_ = 0.0;
+    SliceSettings slice_applied_settings_;
+    std::uint64_t slice_source_project_revision_ = 0;
+    std::uint64_t slice_revision_ = 0;
+    bool slice_invalidated_ = false;
     std::vector<ModelEntry> models_;
     ModelId next_model_id_ = 1;
     ModelId active_model_id_ = 0;

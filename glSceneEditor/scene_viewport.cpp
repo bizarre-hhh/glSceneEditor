@@ -6,8 +6,10 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
+#include <exception>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <QFile>
 #include <QFileInfo>
 #define NOMINMAX
@@ -56,6 +58,33 @@ bool IsLinked(const Shader& shader)
     GLint linked = GL_FALSE;
     glGetProgramiv(shader.ID, GL_LINK_STATUS, &linked);
     return linked == GL_TRUE;
+}
+
+// Parameters of the near-to-far segment that lie inside the axis-aligned box.
+bool SegmentIntersectsBox(const glm::vec3& start, const glm::vec3& segment,
+                          const glm::vec3& minimum, const glm::vec3& maximum,
+                          float& enter, float& leave)
+{
+    enter = 0.0f;
+    leave = 1.0f;
+    for (int axis = 0; axis < 3; ++axis)
+    {
+        if (segment[axis] == 0.0f)
+        {
+            if (start[axis] < minimum[axis] || start[axis] > maximum[axis])
+                return false;
+            continue;
+        }
+        float first = (minimum[axis] - start[axis]) / segment[axis];
+        float last = (maximum[axis] - start[axis]) / segment[axis];
+        if (first > last)
+            std::swap(first, last);
+        enter = std::max(enter, first);
+        leave = std::min(leave, last);
+        if (enter > leave)
+            return false;
+    }
+    return enter >= 0.0f && enter <= 1.0f;
 }
 
 bool ProjectToScreen(const glm::vec3& point, const glm::mat4& view_projection,
@@ -281,6 +310,19 @@ bool SceneViewport::Initialize()
     glEnableVertexAttribArray(1);
     glBindVertexArray(0);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+    // Slice contours use the same position/color layout as bounds.
+    glGenVertexArrays(1, &slice_vao_);
+    glGenBuffers(1, &slice_vbo_);
+    glBindVertexArray(slice_vao_);
+    glBindBuffer(GL_ARRAY_BUFFER, slice_vbo_);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), nullptr);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float),
+                          reinterpret_cast<const void*>(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+    glBindVertexArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
     return true;
 }
 
@@ -305,7 +347,15 @@ void SceneViewport::ScrollCallback(GLFWwindow* window, double, double y_offset)
         return;
     auto* self = static_cast<SceneViewport*>(glfwGetWindowUserPointer(window));
     if (self != nullptr && !self->model_drag_ && !ImGuizmo::IsUsingAny() && !ImGuizmo::IsOver())
-        self->camera_controller_.OnScroll(static_cast<float>(y_offset));
+    {
+        double cursor_x = 0.0;
+        double cursor_y = 0.0;
+        glfwGetCursorPos(window, &cursor_x, &cursor_y);
+        const auto anchor = self->ZoomAnchorAt(
+            glm::vec2(static_cast<float>(cursor_x), static_cast<float>(cursor_y)));
+        self->camera_controller_.OnScroll(
+            static_cast<float>(y_offset), anchor ? &*anchor : nullptr);
+    }
 }
 
 void SceneViewport::MouseButtonCallback(GLFWwindow* window, int button,
@@ -347,8 +397,13 @@ void SceneViewport::DrawSettings()
     ImGui::Separator();
     ImGui::Checkbox("Show ImGui demo", &show_demo_window_);
     ImGui::Checkbox("Wireframe", &wireframe_);
-    ImGui::Text("Base plate: 100 x 100 mm, grid: 10 mm");
-    ImGui::TextUnformatted("Axis length: 120 mm (20% beyond plate)");
+    ImGui::Text("Base plate: %.1f x %.1f mm, grid: %d mm",
+                plate_size_mm_.x, plate_size_mm_.y, BasePlate::kGridStepMm);
+    const glm::vec3 axis_mm =
+        BasePlate::AxisLengthsForSize(plate_size_mm_) *
+        BasePlate::kMmPerWorldUnit;
+    ImGui::Text("Axis length: %.1f x %.1f x %.1f mm (20%% beyond plate)",
+                axis_mm.x, axis_mm.y, axis_mm.z);
     ImGui::Text("Origin: plate corner | X red | Y green | Z blue (up)");
     ImGui::Text("Loaded STL models: %zu", models_.size());
     if (const auto* info = CurrentModelInfo())
@@ -391,6 +446,8 @@ void SceneViewport::DrawSettings()
 
 void SceneViewport::DrawModelBounds(const glm::mat4& view, const glm::mat4& projection)
 {
+    if (models_hidden_)
+        return;
     const auto count = std::count_if(models_.begin(), models_.end(), [](const ModelEntry& entry)
     { return entry.info.visible && entry.info.bounding_box_visible; });
     if (count == 0)
@@ -457,9 +514,101 @@ void SceneViewport::DrawModelBounds(const glm::mat4& view, const glm::mat4& proj
     glBindBuffer(GL_ARRAY_BUFFER, 0);
 }
 
+void SceneViewport::DrawSlicePreview(const glm::mat4& view, const glm::mat4& projection)
+{
+    if (!slice_visible_ || slice_layers_.empty() || !plate_shader_)
+        return;
+    const bool draw_contours =
+        slice_contours_visible_ && slice_contour_vertex_count_ > 0;
+    const bool draw_hatches =
+        slice_hatches_visible_ && slice_hatch_vertex_count_ > 0;
+    const bool draw_arrows =
+        slice_direction_visible_ && slice_hatches_visible_ &&
+        slice_arrow_vertex_count_ > 0;
+    const bool draw_jumps =
+        slice_jumps_visible_ && slice_jump_vertex_count_ > 0;
+    if (!draw_contours && !draw_hatches && !draw_arrows && !draw_jumps)
+        return;
+
+    GLboolean previous_depth_test = glIsEnabled(GL_DEPTH_TEST);
+    GLboolean previous_depth_write = GL_TRUE;
+    GLint previous_depth_function = GL_LESS;
+    GLfloat previous_width = 1.0f;
+    GLfloat width_range[2]{1.0f, 1.0f};
+    GLboolean previous_offset_line = glIsEnabled(GL_POLYGON_OFFSET_LINE);
+    GLfloat previous_offset_factor = 0.0f;
+    GLfloat previous_offset_units = 0.0f;
+    glGetBooleanv(GL_DEPTH_WRITEMASK, &previous_depth_write);
+    glGetIntegerv(GL_DEPTH_FUNC, &previous_depth_function);
+    glGetFloatv(GL_LINE_WIDTH, &previous_width);
+    glGetFloatv(GL_ALIASED_LINE_WIDTH_RANGE, width_range);
+    glGetFloatv(GL_POLYGON_OFFSET_FACTOR, &previous_offset_factor);
+    glGetFloatv(GL_POLYGON_OFFSET_UNITS, &previous_offset_units);
+
+    plate_shader_->use();
+    plate_shader_->setMat4("view", view);
+    plate_shader_->setMat4("projection", projection);
+    plate_shader_->setFloat("alpha", 1.0f);
+    plate_shader_->setFloat("zOffset", 0.0f);
+
+    glBindVertexArray(slice_vao_);
+    if (draw_hatches || draw_arrows || draw_jumps)
+    {
+        // Fills, scan direction and travel moves are inside the solid; draw
+        // them as an x-ray overlay.
+        glDisable(GL_DEPTH_TEST);
+        glDepthMask(GL_FALSE);
+        glDisable(GL_POLYGON_OFFSET_LINE);
+        glLineWidth(std::clamp(1.0f, width_range[0], width_range[1]));
+        if (draw_hatches)
+            glDrawArrays(GL_LINES, slice_contour_vertex_count_,
+                         slice_hatch_vertex_count_);
+        if (draw_arrows)
+            glDrawArrays(GL_LINES,
+                         slice_contour_vertex_count_ +
+                             slice_hatch_vertex_count_,
+                         slice_arrow_vertex_count_);
+        if (draw_jumps)
+            glDrawArrays(GL_LINES,
+                         slice_contour_vertex_count_ +
+                             slice_hatch_vertex_count_ +
+                             slice_arrow_vertex_count_,
+                         slice_jump_vertex_count_);
+    }
+    if (draw_contours)
+    {
+        glEnable(GL_DEPTH_TEST);
+        glDepthFunc(GL_LEQUAL);
+        glDepthMask(GL_FALSE);
+        glEnable(GL_POLYGON_OFFSET_LINE);
+        glPolygonOffset(-1.0f, -1.0f);
+        glLineWidth(std::clamp(2.0f, width_range[0], width_range[1]));
+        glDrawArrays(GL_LINES, 0, slice_contour_vertex_count_);
+    }
+    glLineWidth(previous_width);
+    glPolygonOffset(previous_offset_factor, previous_offset_units);
+    if (previous_offset_line)
+        glEnable(GL_POLYGON_OFFSET_LINE);
+    else
+        glDisable(GL_POLYGON_OFFSET_LINE);
+    glDepthMask(previous_depth_write);
+    glDepthFunc(previous_depth_function);
+    if (previous_depth_test)
+        glEnable(GL_DEPTH_TEST);
+    else
+        glDisable(GL_DEPTH_TEST);
+    glBindVertexArray(0);
+}
+
 bool SceneViewport::RenderFrame()
 {
     glfwMakeContextCurrent(window_);
+    if (!slice_layers_.empty() &&
+        slice_source_project_revision_ != project_revision_)
+    {
+        ClearSlicePreview();
+        slice_invalidated_ = true;
+    }
     glfwPollEvents();
     if (glfwWindowShouldClose(window_))
     {
@@ -496,8 +645,23 @@ bool SceneViewport::RenderFrame()
     const ViewCube::Layout cube_layout = ViewCube::GetLayout(
         glm::vec2(io.DisplaySize.x, io.DisplaySize.y), dpi_scale);
     const bool over_cube = ViewCube::Contains(glm::vec2(io.MousePos.x, io.MousePos.y), cube_layout);
+    const auto pan_depth = [this](float x, float y) -> std::optional<float>
+    {
+        const Camera& camera = camera_controller_.GetCamera();
+        const auto ray = MouseRayAt({x, y});
+        if (!ray)
+            return std::nullopt;
+        const auto hit = ClosestScenePoint(*ray);
+        if (!hit)
+            return std::nullopt;
+        const glm::vec3 forward =
+            glm::normalize(camera.Target() - camera.Position());
+        const float depth = glm::dot(*hit - camera.Position(), forward);
+        return depth > 0.0f ? std::optional<float>(depth) : std::nullopt;
+    };
     camera_controller_.Update(window_, io.WantCaptureMouse || over_cube || model_drag_.has_value() || ImGuizmo::IsUsingAny(),
-                              io.WantCaptureKeyboard || model_drag_.has_value() || ImGuizmo::IsUsingAny());
+                              io.WantCaptureKeyboard || model_drag_.has_value() || ImGuizmo::IsUsingAny(),
+                              pan_depth);
     if (show_demo_window_)
         ImGui::ShowDemoWindow(&show_demo_window_);
     if (show_settings_)
@@ -508,12 +672,14 @@ bool SceneViewport::RenderFrame()
     const float aspect = static_cast<float>(display_width) / display_height;
     const glm::mat4 projection = ProjectionMatrix(aspect);
     const glm::mat4 view = camera.GetViewMatrix();
-    const bool over_gizmo = DrawModelGizmo(view, projection, over_cube);
+    const bool over_gizmo =
+        models_hidden_ ? false : DrawModelGizmo(view, projection, over_cube);
     if (pending_pick_)
     {
         const glm::vec2 position = *pending_pick_;
         pending_pick_.reset();
-        if (!IsTransformEditing() && !io.WantCaptureMouse && !over_gizmo && !ViewCube::Contains(position, cube_layout))
+        if (!models_hidden_ && !IsTransformEditing() && !io.WantCaptureMouse &&
+            !over_gizmo && !ViewCube::Contains(position, cube_layout))
         {
             const auto ray = MouseRayAt(position);
             glm::vec3 hit_point(0.0f);
@@ -534,14 +700,21 @@ bool SceneViewport::RenderFrame()
     }
     if (model_drag_)
     {
-        const auto* dragged = ModelInfo(model_drag_->id);
-        if (!ImGui::IsMouseDown(ImGuiMouseButton_Left) || !dragged || !dragged->selected || !dragged->visible ||
-            ImGui::IsMouseDown(ImGuiMouseButton_Right) || ImGui::IsMouseDown(ImGuiMouseButton_Middle))
+        if (models_hidden_)
             EndModelTransform();
         else
         {
-            UpdateModelDrag(glm::vec2(io.MousePos.x, io.MousePos.y));
-            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
+            const auto* dragged = ModelInfo(model_drag_->id);
+            if (!ImGui::IsMouseDown(ImGuiMouseButton_Left) || !dragged ||
+                !dragged->selected || !dragged->visible ||
+                ImGui::IsMouseDown(ImGuiMouseButton_Right) ||
+                ImGui::IsMouseDown(ImGuiMouseButton_Middle))
+                EndModelTransform();
+            else
+            {
+                UpdateModelDrag(glm::vec2(io.MousePos.x, io.MousePos.y));
+                ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
+            }
         }
     }
     DrawAxisLabels(axis_label_font_, camera, projection * view, *base_plate_);
@@ -551,7 +724,8 @@ bool SceneViewport::RenderFrame()
     glClearColor(clear_color_[0], clear_color_[1],
                  clear_color_[2], clear_color_[3]);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-    const bool has_bounds = std::any_of(models_.begin(), models_.end(), [](const ModelEntry& entry)
+    const bool has_bounds = !models_hidden_ &&
+        std::any_of(models_.begin(), models_.end(), [](const ModelEntry& entry)
     { return entry.info.visible && entry.info.bounding_box_visible; });
     GLboolean previous_offset_fill = GL_FALSE;
     GLfloat previous_offset_factor = 0.0f, previous_offset_units = 0.0f;
@@ -566,9 +740,10 @@ bool SceneViewport::RenderFrame()
         glPolygonOffset(1.0f, 1.0f);
     }
     glPolygonMode(GL_FRONT_AND_BACK, wireframe_ ? GL_LINE : GL_FILL);
-    for (const auto& entry : models_)
-        if (entry.info.visible)
-            entry.model->Draw(*stl_shader_, view, projection, entry.info.selected);
+    if (!models_hidden_)
+        for (const auto& entry : models_)
+            if (entry.info.visible)
+                entry.model->Draw(*stl_shader_, view, projection, entry.info.selected);
     glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
     base_plate_->Draw(*plate_shader_, view, projection, camera);
     if (has_bounds)
@@ -577,7 +752,9 @@ bool SceneViewport::RenderFrame()
         if (!previous_offset_fill)
             glDisable(GL_POLYGON_OFFSET_FILL);
     }
-    DrawModelBounds(view, projection);
+    if (!models_hidden_)
+        DrawModelBounds(view, projection);
+    DrawSlicePreview(view, projection);
 
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
     glfwSwapBuffers(window_);
@@ -667,7 +844,8 @@ bool SceneViewport::LoadStl(const std::string& path, std::string& error,
     auto loaded = std::make_unique<StlModel>();
     if (!loaded->LoadFromMemory(data.constData(), data.size(), error))
         return false;
-    loaded->SetPlacementCenterMm(plate_size_mm_ * 0.5f);
+    loaded->SetPlacementCenterMm(
+        glm::vec2(plate_size_mm_.x, plate_size_mm_.y) * 0.5f);
     size_mm = loaded->SizeMm();
     StlModelInfo info{path, size_mm, loaded->TriangleCount()};
     QSet<QString> names;
@@ -961,6 +1139,106 @@ void SceneViewport::ClearModelSelection()
         ++model_state_revision_;
 }
 
+std::optional<glm::vec3> SceneViewport::ClosestScenePoint(
+    const MouseRay& ray) const
+{
+    if (models_hidden_)
+        return std::nullopt;
+    const glm::vec3 segment = ray.end - ray.start;
+    const float length_squared = glm::dot(segment, segment);
+    if (length_squared <= 0.0f)
+        return std::nullopt;
+
+    // Bounds only prune the list; the pivot must be the real visible surface,
+    // otherwise zoom and pan slow down by the gap between the box and mesh.
+    struct Candidate
+    {
+        float entry = 0.0f;
+        const ModelEntry* model = nullptr;
+    };
+    std::vector<Candidate> candidates;
+    candidates.reserve(models_.size());
+    for (const auto& entry : models_)
+    {
+        if (!entry.info.visible)
+            continue;
+        glm::vec3 minimum(0.0f);
+        glm::vec3 maximum(0.0f);
+        entry.model->GetWorldBounds(minimum, maximum);
+        float enter = 0.0f;
+        float leave = 0.0f;
+        if (SegmentIntersectsBox(ray.start, segment, minimum, maximum,
+                                 enter, leave))
+            candidates.push_back({enter, &entry});
+    }
+    std::sort(candidates.begin(), candidates.end(),
+              [](const Candidate& a, const Candidate& b)
+              { return a.entry < b.entry; });
+
+    float nearest = FLT_MAX;
+    glm::vec3 nearest_point(0.0f);
+
+    // The plate is opaque from above and the main zoom surface there.
+    const glm::vec2 plate_world(plate_size_mm_.x / BasePlate::kMmPerWorldUnit,
+                                plate_size_mm_.y / BasePlate::kMmPerWorldUnit);
+    if (segment.z != 0.0f)
+    {
+        const float t = -ray.start.z / segment.z;
+        if (t >= 0.0f && t <= 1.0f)
+        {
+            const glm::vec3 point = ray.start + segment * t;
+            if (point.x >= 0.0f && point.x <= plate_world.x &&
+                point.y >= 0.0f && point.y <= plate_world.y)
+            {
+                nearest = t;
+                nearest_point = point;
+            }
+        }
+    }
+
+    for (const Candidate& candidate : candidates)
+    {
+        if (candidate.entry > nearest)
+            break;
+        glm::vec3 hit(0.0f);
+        if (!candidate.model->model->IntersectsSegment(
+                ray.start, ray.end, &hit))
+            continue;
+        const float t = glm::dot(hit - ray.start, segment) / length_squared;
+        if (t < nearest)
+        {
+            nearest = t;
+            nearest_point = hit;
+        }
+    }
+
+    if (nearest == FLT_MAX)
+        return std::nullopt;
+    return nearest_point;
+}
+
+std::optional<glm::vec3> SceneViewport::ZoomAnchorAt(
+    const glm::vec2& position) const
+{
+    // Orthographic zoom is centered and already keeps a constant rate.
+    if (camera_controller_.GetCamera().IsOrthographic())
+        return std::nullopt;
+    if (const auto ray = MouseRayAt(position))
+        if (const auto hit = ClosestScenePoint(*ray))
+            return hit;
+    // Cursor over the background: zoom about the content in the view center
+    // so the visible scene still scales at the same rate.
+    int width = 0;
+    int height = 0;
+    glfwGetWindowSize(window_, &width, &height);
+    if (width <= 0 || height <= 0)
+        return std::nullopt;
+    if (const auto ray = MouseRayAt(
+            glm::vec2(width * 0.5f, height * 0.5f)))
+        return ClosestScenePoint(*ray);
+    return std::nullopt;
+}
+
 std::optional<SceneViewport::MouseRay> SceneViewport::MouseRayAt(
     const glm::vec2& position, bool require_inside) const
 {
@@ -989,6 +1267,8 @@ std::optional<SceneViewport::MouseRay> SceneViewport::MouseRayAt(
 SceneViewport::ModelEntry* SceneViewport::ClosestModel(
     const MouseRay& ray, glm::vec3* hit_point)
 {
+    if (models_hidden_)
+        return nullptr;
     ModelEntry* closest = nullptr;
     float nearest_distance = FLT_MAX;
     for (auto& entry : models_)
@@ -1268,6 +1548,18 @@ bool SceneViewport::ApplyTransform(ModelEntry& entry, const ModelTransform& tran
     return true;
 }
 
+bool SceneViewport::IsModelPositionAllowed(const glm::vec3& position_mm) const
+{
+    // The usable platform spans [0, size]. Allow one more platform size in
+    // each direction, so X is [-length, 2 * length] and likewise for Y and Z.
+    return position_mm.x >= -plate_size_mm_.x &&
+        position_mm.x <= 2.0f * plate_size_mm_.x &&
+        position_mm.y >= -plate_size_mm_.y &&
+        position_mm.y <= 2.0f * plate_size_mm_.y &&
+        position_mm.z >= -plate_size_mm_.z &&
+        position_mm.z <= 2.0f * plate_size_mm_.z;
+}
+
 bool SceneViewport::ApplyTransforms(const std::vector<ModelTransformChange>& changes, bool forward)
 {
     for (const auto& change : changes)
@@ -1295,6 +1587,7 @@ bool SceneViewport::BeginModelTransform(ModelId id, TransformMode mode)
     EndModelTransform();
     const auto* entry = FindModel(id);
     if (!entry) return false;
+    if (models_hidden_) SetModelsHidden(false);
     pending_transform_ = PendingTransform{id, mode, entry->model->Transform(), project_revision_};
     return true;
 }
@@ -1309,6 +1602,12 @@ bool SceneViewport::TransformModelTo(ModelId id, const ModelTransform& transform
     const auto before_revision = project_revision_;
     if (!ApplyTransform(*entry, transform)) return false;
     if (before == transform) return true;
+    if (mode == TransformMode::Translate &&
+        !IsModelPositionAllowed(entry->info.world_position_mm))
+    {
+        ApplyTransform(*entry, before);
+        return false;
+    }
     AdvanceProjectRevision();
     if (!pending_transform_)
     {
@@ -1372,6 +1671,7 @@ bool SceneViewport::BeginTransformEditing(ModelId id, TransformMode mode)
     const auto* entry = FindModel(id);
     if (!entry || !entry->info.selected || (IsTransformEditing() && transform_editing_model_id_ != id))
         return false;
+    if (models_hidden_) SetModelsHidden(false);
     SetTransformMode(mode);
     const bool starting = !IsTransformEditing();
     transform_editing_model_id_ = id;
@@ -1415,6 +1715,11 @@ bool SceneViewport::TransformModelFromGizmo(ModelId id, const glm::mat4& matrix,
 
 bool SceneViewport::DrawModelGizmo(const glm::mat4& view, const glm::mat4& projection, bool over_cube)
 {
+    if (models_hidden_)
+    {
+        if (gizmo_dragging_) ReleaseCursor();
+        return false;
+    }
     const auto* entry = FindModel(transform_editing_model_id_);
     if (!entry || !entry->info.selected || !entry->info.visible || model_drag_)
     {
@@ -1575,7 +1880,7 @@ bool SceneViewport::Redo(QString& error)
     return true;
 }
 
-void SceneViewport::ApplyPlateSizeMm(const glm::vec2& size_mm)
+void SceneViewport::ApplyPlateSizeMm(const glm::vec3& size_mm)
 {
     glfwMakeContextCurrent(window_);
     base_plate_->SetSize(size_mm);
@@ -1584,12 +1889,13 @@ void SceneViewport::ApplyPlateSizeMm(const glm::vec2& size_mm)
     RefreshSceneBounds();
 }
 
-bool SceneViewport::SetPlateSizeMm(const glm::vec2& size_mm, QString& error)
+bool SceneViewport::SetPlateSizeMm(const glm::vec3& size_mm, QString& error)
 {
     error.clear();
     if (!PlateDimensions::IsValid(size_mm))
     {
-        error = QStringLiteral("平台长度和宽度必须在 1 至 10000 mm 之间。");
+        error = QStringLiteral(
+            "平台长度、宽度和高度必须在 1 至 10000 mm 之间。");
         return false;
     }
     if (!base_plate_ || graphics_released_)
@@ -1605,15 +1911,434 @@ bool SceneViewport::SetPlateSizeMm(const glm::vec2& size_mm, QString& error)
     operation.before_plate_size = plate_size_mm_;
     operation.after_plate_size = size_mm;
     operation.before_revision = project_revision_;
-    operation.description = QStringLiteral("修改平台尺寸：%1 × %2 mm → %3 × %4 mm")
-        .arg(plate_size_mm_.x, 0, 'f', 2).arg(plate_size_mm_.y, 0, 'f', 2)
-        .arg(size_mm.x, 0, 'f', 2).arg(size_mm.y, 0, 'f', 2);
+    operation.description = QStringLiteral(
+        "修改平台尺寸：%1 × %2 × %3 mm → %4 × %5 × %6 mm")
+        .arg(plate_size_mm_.x, 0, 'f', 2)
+        .arg(plate_size_mm_.y, 0, 'f', 2)
+        .arg(plate_size_mm_.z, 0, 'f', 2)
+        .arg(size_mm.x, 0, 'f', 2)
+        .arg(size_mm.y, 0, 'f', 2)
+        .arg(size_mm.z, 0, 'f', 2);
     ApplyPlateSizeMm(size_mm);
     ResetView();
     AdvanceProjectRevision();
     operation.after_revision = project_revision_;
     RecordOperation(std::move(operation));
     return true;
+}
+
+bool SceneViewport::PrepareSlice(const SliceSettings& settings,
+                                 SliceEstimate& estimate,
+                                 QString& error) const
+{
+    error.clear();
+    estimate = {};
+    if (models_.empty())
+    {
+        error = QStringLiteral("没有可切片的模型，请先导入 STL 模型。");
+        return false;
+    }
+    const double layer_thickness_mm = settings.layer_thickness_mm;
+    if (!std::isfinite(layer_thickness_mm) ||
+        layer_thickness_mm < kMinLayerThicknessMm ||
+        layer_thickness_mm > kMaxLayerThicknessMm)
+    {
+        error = QStringLiteral("层厚必须在 %1 到 %2 mm 之间。")
+            .arg(kMinLayerThicknessMm, 0, 'f', 3)
+            .arg(kMaxLayerThicknessMm, 0, 'f', 1);
+        return false;
+    }
+    if (settings.hatch.enabled)
+    {
+        if (!std::isfinite(settings.hatch.spacing_mm) ||
+            settings.hatch.spacing_mm < kMinHatchSpacingMm ||
+            settings.hatch.spacing_mm > kMaxHatchSpacingMm)
+        {
+            error = QStringLiteral("扫描间距必须在 %1 到 %2 mm 之间。")
+                .arg(kMinHatchSpacingMm, 0, 'f', 3)
+                .arg(kMaxHatchSpacingMm, 0, 'f', 1);
+            return false;
+        }
+        if (!std::isfinite(settings.hatch.angle_deg) ||
+            !std::isfinite(settings.hatch.layer_angle_increment_deg))
+        {
+            error = QStringLiteral("扫描角度和层间角度增量必须是有限数值。");
+            return false;
+        }
+        if (!std::isfinite(settings.hatch.spot_compensation_mm) ||
+            settings.hatch.spot_compensation_mm < 0.0)
+        {
+            error = QStringLiteral("光斑补偿必须是非负有限数值。");
+            return false;
+        }
+    }
+
+    constexpr double kBoundsToleranceMm = 1.0e-3;
+    QStringList outside_models;
+    std::uint64_t triangle_count = 0;
+    double max_z_mm = 0.0;
+    for (const auto& entry : models_)
+    {
+        const auto& info = entry.info;
+        if (info.world_bounds_min_mm.x < -kBoundsToleranceMm ||
+            info.world_bounds_min_mm.y < -kBoundsToleranceMm ||
+            info.world_bounds_max_mm.x > plate_size_mm_.x + kBoundsToleranceMm ||
+            info.world_bounds_max_mm.y > plate_size_mm_.y + kBoundsToleranceMm)
+        {
+            outside_models.append(info.name);
+        }
+        triangle_count += static_cast<std::uint64_t>(info.triangle_count);
+        max_z_mm = std::max(max_z_mm, static_cast<double>(info.world_bounds_max_mm.z));
+    }
+
+    if (!outside_models.isEmpty())
+    {
+        error = QStringLiteral("以下模型超出平台范围，请先移回平台内再切片：\n%1")
+            .arg(outside_models.join(QStringLiteral("\n")));
+        return false;
+    }
+    if (max_z_mm <= 0.0)
+    {
+        error = QStringLiteral("所有模型都在平台下方，没有可切片的 Z 范围。");
+        return false;
+    }
+
+    estimate.max_z_mm = max_z_mm;
+    estimate.triangle_count = static_cast<std::size_t>(
+        std::min<std::uint64_t>(triangle_count,
+            static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())));
+    const double estimated = std::ceil(max_z_mm / layer_thickness_mm);
+    estimate.estimated_layers = estimated <= 0.0
+        ? 1
+        : static_cast<std::size_t>(estimated);
+    if (estimate.estimated_layers > kMaxSliceLayers)
+    {
+        error = QStringLiteral("预计层数超过 %1，请增大层厚后再切片。")
+            .arg(static_cast<qulonglong>(kMaxSliceLayers));
+        return false;
+    }
+    return true;
+}
+
+bool SceneViewport::GenerateSlice(const SliceSettings& settings,
+                                  const SliceProgressCallback& progress,
+                                  bool& cancelled, QString& error, QStringList& issues)
+{
+    cancelled = false;
+    error.clear();
+    issues.clear();
+
+    SliceEstimate estimate;
+    if (!PrepareSlice(settings, estimate, error))
+        return false;
+
+    std::vector<SliceModelInput> inputs;
+    inputs.reserve(models_.size());
+    for (const auto& entry : models_)
+    {
+        SliceModelInput input;
+        input.id = entry.info.id;
+        input.name = entry.info.name.toUtf8().toStdString();
+        entry.model->AppendBuildTrianglesMm(input.triangles);
+        inputs.push_back(std::move(input));
+    }
+
+    SliceResult result;
+    try
+    {
+        result = SliceBuild(inputs, settings, progress);
+    }
+    catch (const std::exception& exception)
+    {
+        error = QStringLiteral("切片失败：%1")
+            .arg(QString::fromUtf8(exception.what()));
+        return false;
+    }
+
+    if (result.cancelled)
+    {
+        cancelled = true;
+        return false;
+    }
+    for (const SliceIssue& issue : result.issues)
+    {
+        issues.append(QStringLiteral("%1：%2")
+            .arg(QString::fromUtf8(issue.name.c_str()),
+                 QString::fromUtf8(issue.message.c_str())));
+    }
+    if (!result.ok)
+    {
+        QString message = result.error.empty()
+            ? QStringLiteral("没有生成任何有效切片。")
+            : QString::fromUtf8(result.error.c_str());
+        if (!issues.isEmpty())
+            message += QStringLiteral("\n\n") + issues.join(QStringLiteral("\n"));
+        error = message;
+        return false;
+    }
+
+    slice_layers_ = std::move(result.layers);
+    slice_total_contour_path_length_mm_ = result.total_contour_path_length_mm;
+    slice_total_hatch_path_length_mm_ = result.total_hatch_path_length_mm;
+    slice_total_path_length_mm_ = result.total_path_length_mm;
+    slice_current_layer_ = 0;
+    slice_visible_ = true;
+    slice_contours_visible_ = true;
+    slice_hatches_visible_ = true;
+    slice_direction_visible_ = false;
+    slice_jumps_visible_ = false;
+    models_hidden_ = false;
+    slice_applied_settings_ = settings;
+    slice_source_project_revision_ = project_revision_;
+    slice_invalidated_ = false;
+    UploadSliceLayer();
+    ++slice_revision_;
+    return true;
+}
+
+void SceneViewport::ClearSlicePreview()
+{
+    if (slice_layers_.empty() && !slice_visible_)
+        return;
+    if (window_ != nullptr && glad_ready_)
+        glfwMakeContextCurrent(window_);
+    slice_layers_.clear();
+    slice_current_layer_ = 0;
+    slice_visible_ = false;
+    slice_contours_visible_ = true;
+    slice_hatches_visible_ = true;
+    slice_direction_visible_ = false;
+    slice_jumps_visible_ = false;
+    models_hidden_ = false;
+    slice_total_contour_path_length_mm_ = 0.0;
+    slice_total_hatch_path_length_mm_ = 0.0;
+    slice_total_path_length_mm_ = 0.0;
+    slice_contour_vertex_count_ = 0;
+    slice_hatch_vertex_count_ = 0;
+    slice_arrow_vertex_count_ = 0;
+    slice_jump_vertex_count_ = 0;
+    slice_jump_count_ = 0;
+    slice_jump_path_length_mm_ = 0.0;
+    slice_source_project_revision_ = 0;
+    ++slice_revision_;
+}
+
+void SceneViewport::SetSlicePreviewVisible(bool visible)
+{
+    const bool next = visible && !slice_layers_.empty();
+    if (slice_visible_ == next)
+        return;
+    slice_visible_ = next;
+    ++slice_revision_;
+}
+
+void SceneViewport::SetSliceContoursVisible(bool visible)
+{
+    if (slice_layers_.empty() || slice_contours_visible_ == visible)
+        return;
+    slice_contours_visible_ = visible;
+    ++slice_revision_;
+}
+
+void SceneViewport::SetSliceHatchesVisible(bool visible)
+{
+    if (slice_layers_.empty() || slice_hatches_visible_ == visible)
+        return;
+    slice_hatches_visible_ = visible;
+    ++slice_revision_;
+}
+
+void SceneViewport::SetSliceDirectionVisible(bool visible)
+{
+    if (slice_layers_.empty() || slice_direction_visible_ == visible)
+        return;
+    slice_direction_visible_ = visible;
+    ++slice_revision_;
+}
+
+void SceneViewport::SetSliceJumpsVisible(bool visible)
+{
+    if (slice_layers_.empty() || slice_jumps_visible_ == visible)
+        return;
+    slice_jumps_visible_ = visible;
+    ++slice_revision_;
+}
+
+void SceneViewport::SetModelsHidden(bool hidden)
+{
+    if (models_hidden_ == hidden)
+        return;
+    if (hidden)
+        EndModelTransform();
+    models_hidden_ = hidden;
+    ++slice_revision_;
+}
+
+bool SceneViewport::SetSliceLayer(std::size_t index)
+{
+    if (slice_layers_.empty() || index == 0 || index > slice_layers_.size())
+        return false;
+    const std::size_t next = index - 1;
+    if (next == slice_current_layer_)
+        return true;
+    slice_current_layer_ = next;
+    UploadSliceLayer();
+    ++slice_revision_;
+    return true;
+}
+
+SceneViewport::SlicePreviewInfo SceneViewport::SliceInfo() const
+{
+    SlicePreviewInfo info;
+    info.has_preview = !slice_layers_.empty();
+    info.visible = slice_visible_ && info.has_preview;
+    info.contours_visible = slice_contours_visible_ && info.has_preview;
+    info.hatches_visible = slice_hatches_visible_ && info.has_preview;
+    info.direction_visible = slice_direction_visible_ && info.has_preview;
+    info.jumps_visible = slice_jumps_visible_ && info.has_preview;
+    info.models_hidden = models_hidden_;
+    info.layer_count = slice_layers_.size();
+    info.total_contour_path_length_mm = slice_total_contour_path_length_mm_;
+    info.total_hatch_path_length_mm = slice_total_hatch_path_length_mm_;
+    info.total_path_length_mm = slice_total_path_length_mm_;
+    info.hatch = slice_applied_settings_.hatch;
+    if (info.has_preview && slice_current_layer_ < slice_layers_.size())
+    {
+        const SliceLayer& layer = slice_layers_[slice_current_layer_];
+        info.layer_index = slice_current_layer_ + 1;
+        info.z_mm = layer.z_mm;
+        info.contour_count = layer.contours.size();
+        info.hatch_count = layer.hatches.size();
+        info.jump_count = slice_jump_count_;
+        info.layer_contour_path_length_mm = layer.contour_path_length_mm;
+        info.layer_hatch_path_length_mm = layer.hatch_path_length_mm;
+        info.layer_jump_path_length_mm = slice_jump_path_length_mm_;
+        info.layer_path_length_mm = layer.path_length_mm;
+    }
+    return info;
+}
+
+bool SceneViewport::ConsumeSliceInvalidation()
+{
+    const bool invalidated = slice_invalidated_;
+    slice_invalidated_ = false;
+    return invalidated;
+}
+
+void SceneViewport::UploadSliceLayer()
+{
+    slice_contour_vertex_count_ = 0;
+    slice_hatch_vertex_count_ = 0;
+    slice_arrow_vertex_count_ = 0;
+    slice_jump_vertex_count_ = 0;
+    slice_jump_count_ = 0;
+    slice_jump_path_length_mm_ = 0.0;
+    if (slice_layers_.empty() || slice_current_layer_ >= slice_layers_.size() ||
+        window_ == nullptr || !glad_ready_ || slice_vao_ == 0)
+        return;
+
+    glfwMakeContextCurrent(window_);
+    const SliceLayer& layer = slice_layers_[slice_current_layer_];
+    const glm::vec3 contour_color(0.0f, 0.85f, 1.0f);
+    const glm::vec3 hatch_color(0.95f, 0.10f, 0.70f);
+    const glm::vec3 arrow_color(0.98f, 0.98f, 0.98f);
+    const glm::vec3 jump_color(0.15f, 1.0f, 0.35f);
+    const float z = static_cast<float>(
+        layer.z_mm / BasePlate::kMmPerWorldUnit);
+    std::vector<float> vertices;
+    auto add_segment = [&](const std::array<double, 2>& a,
+                           const std::array<double, 2>& b,
+                           const glm::vec3& color)
+    {
+        const float points[] = {
+            static_cast<float>(a[0] / BasePlate::kMmPerWorldUnit),
+            static_cast<float>(a[1] / BasePlate::kMmPerWorldUnit),
+            z,
+            static_cast<float>(b[0] / BasePlate::kMmPerWorldUnit),
+            static_cast<float>(b[1] / BasePlate::kMmPerWorldUnit),
+            z
+        };
+        for (int point = 0; point < 2; ++point)
+        {
+            const int offset = point * 3;
+            vertices.insert(vertices.end(), {
+                points[offset], points[offset + 1], points[offset + 2],
+                color.x, color.y, color.z
+            });
+        }
+    };
+
+    for (const SlicePath& path : layer.contours)
+        for (std::size_t i = 1; i < path.points.size(); ++i)
+            add_segment(path.points[i - 1], path.points[i], contour_color);
+    const int contour_vertices = static_cast<int>(vertices.size() / 6);
+
+    for (const SliceHatchLine& line : layer.hatches)
+        add_segment(line.start, line.end, hatch_color);
+    const int hatch_vertices =
+        static_cast<int>(vertices.size() / 6) - contour_vertices;
+
+    constexpr double kPi = 3.14159265358979323846;
+    constexpr double kArrowAngle = 30.0 * kPi / 180.0;
+    // Keep every arrowhead the same physical size; only the line length
+    // varies between scan vectors.
+    constexpr double kArrowWingMm = 0.1;
+    for (const SliceHatchLine& line : layer.hatches)
+    {
+        const double dx = line.end[0] - line.start[0];
+        const double dy = line.end[1] - line.start[1];
+        const double length = std::hypot(dx, dy);
+        if (length <= 1.0e-9)
+            continue;
+        const double ux = dx / length;
+        const double uy = dy / length;
+        const double back = kArrowWingMm * std::cos(kArrowAngle);
+        const double side = kArrowWingMm * std::sin(kArrowAngle);
+        const std::array<double, 2> tip = line.end;
+        const std::array<double, 2> left{
+            tip[0] - ux * back - uy * side,
+            tip[1] - uy * back + ux * side};
+        const std::array<double, 2> right{
+            tip[0] - ux * back + uy * side,
+            tip[1] - uy * back - ux * side};
+        add_segment(left, tip, arrow_color);
+        add_segment(right, tip, arrow_color);
+    }
+    const int arrow_vertices =
+        static_cast<int>(vertices.size() / 6) - contour_vertices - hatch_vertices;
+
+    for (std::size_t i = 1; i < layer.hatches.size(); ++i)
+    {
+        const SliceHatchLine& previous = layer.hatches[i - 1];
+        const SliceHatchLine& next = layer.hatches[i];
+        if (previous.model_id != next.model_id)
+            continue;
+        const std::array<double, 2>& start = previous.end;
+        const std::array<double, 2>& end = next.start;
+        const double dx = end[0] - start[0];
+        const double dy = end[1] - start[1];
+        const double length = std::hypot(dx, dy);
+        if (length <= 1.0e-9)
+            continue;
+        ++slice_jump_count_;
+        slice_jump_path_length_mm_ += length;
+        add_segment(start, end, jump_color);
+    }
+    const int jump_vertices = static_cast<int>(vertices.size() / 6) -
+                              contour_vertices - hatch_vertices -
+                              arrow_vertices;
+
+    glBindVertexArray(slice_vao_);
+    glBindBuffer(GL_ARRAY_BUFFER, slice_vbo_);
+    glBufferData(GL_ARRAY_BUFFER,
+                 static_cast<GLsizeiptr>(vertices.size() * sizeof(float)),
+                 vertices.empty() ? nullptr : vertices.data(), GL_STREAM_DRAW);
+    glBindVertexArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    slice_contour_vertex_count_ = contour_vertices;
+    slice_hatch_vertex_count_ = hatch_vertices;
+    slice_arrow_vertex_count_ = arrow_vertices;
+    slice_jump_vertex_count_ = jump_vertices;
 }
 
 void SceneViewport::ResetView()
@@ -1628,6 +2353,7 @@ void SceneViewport::ResetView()
 
 void SceneViewport::ResetProjectDisplay()
 {
+    ClearSlicePreview();
     EndTransformEditing();
     transform_mode_ = TransformMode::Translate;
     camera_controller_.GetCamera() = Camera();
@@ -1713,7 +2439,7 @@ void SceneViewport::NewProject()
     glfwMakeContextCurrent(window_);
     pending_pick_.reset();
     models_.clear();
-    ApplyPlateSizeMm(glm::vec2(PlateDimensions::kDefaultMm));
+    ApplyPlateSizeMm(PlateDimensions::DefaultSizeMm());
     active_model_id_ = 0;
     RefreshSceneBounds();
     ResetProjectDisplay();
@@ -1754,6 +2480,30 @@ void SceneViewport::ReleaseGraphics()
         glDeleteVertexArrays(1, &bounds_vao_);
     bounds_vbo_ = 0;
     bounds_vao_ = 0;
+    if (slice_vbo_ != 0)
+        glDeleteBuffers(1, &slice_vbo_);
+    if (slice_vao_ != 0)
+        glDeleteVertexArrays(1, &slice_vao_);
+    slice_vbo_ = 0;
+    slice_vao_ = 0;
+    slice_contour_vertex_count_ = 0;
+    slice_hatch_vertex_count_ = 0;
+    slice_arrow_vertex_count_ = 0;
+    slice_jump_vertex_count_ = 0;
+    slice_jump_count_ = 0;
+    slice_jump_path_length_mm_ = 0.0;
+    slice_layers_.clear();
+    slice_current_layer_ = 0;
+    slice_visible_ = false;
+    slice_contours_visible_ = true;
+    slice_hatches_visible_ = true;
+    slice_direction_visible_ = false;
+    slice_jumps_visible_ = false;
+    models_hidden_ = false;
+    slice_total_contour_path_length_mm_ = 0.0;
+    slice_total_hatch_path_length_mm_ = 0.0;
+    slice_total_path_length_mm_ = 0.0;
+    slice_applied_settings_ = {};
     if (stl_shader_)
         glDeleteProgram(stl_shader_->ID);
     if (plate_shader_)

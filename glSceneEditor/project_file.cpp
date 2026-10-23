@@ -11,7 +11,7 @@
 namespace
 {
 constexpr quint32 kMagic = 0x474C5052; // GLPR
-constexpr quint32 kVersion = 4;
+constexpr quint32 kVersion = 5;
 constexpr quint32 kMaxModels = 10000;
 constexpr quint32 kMaxPathBytes = 1024 * 1024;
 // Qt 5 QByteArray is int-sized. Bound allocations before reading file data.
@@ -80,7 +80,7 @@ bool ProjectFile::Validate(const ProjectData& project, QString& error)
     error.clear();
     if (!PlateDimensions::IsValid(project.plate_size_mm))
     {
-        error = QStringLiteral("平台长度和宽度必须在 1 至 10000 mm 之间。");
+        error = QStringLiteral("平台长度、宽度和高度必须在 1 至 10000 mm 之间。");
         return false;
     }
     bool valid = project.models.size() <= kMaxModels;
@@ -128,7 +128,7 @@ bool ProjectFile::Read(const QString& path, ProjectData& project, QString& error
         error = QStringLiteral("这不是有效的 glSceneEditor 工程文件。");
         return false;
     }
-    if (version != 1 && version != 2 && version != 3 && version != kVersion)
+    if (version < 1 || version > kVersion)
     {
         error = QStringLiteral("不支持工程版本 %1，请使用兼容的软件版本。").arg(version);
         return false;
@@ -148,7 +148,11 @@ bool ProjectFile::Read(const QString& path, ProjectData& project, QString& error
         valid = ReadBool(stream, flag) && ReadBool(stream, flag);
     }
     if (version >= 3)
+    {
         stream >> loaded.plate_size_mm.x >> loaded.plate_size_mm.y;
+        if (version >= 5)
+            stream >> loaded.plate_size_mm.z;
+    }
     stream >> count;
     valid = valid && stream.status() == QDataStream::Ok && count <= kMaxModels;
     for (quint32 i = 0; valid && i < count; ++i)
@@ -209,7 +213,8 @@ bool ProjectFile::Write(const QString& path, const ProjectData& project, QString
     QDataStream stream(&file);
     Configure(stream);
     stream << kMagic << kVersion;
-    stream << project.plate_size_mm.x << project.plate_size_mm.y;
+    stream << project.plate_size_mm.x << project.plate_size_mm.y
+           << project.plate_size_mm.z;
     stream << static_cast<quint32>(project.models.size());
     QSet<QString> names;
     for (const auto& model : project.models)

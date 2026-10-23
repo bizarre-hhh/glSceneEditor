@@ -11,6 +11,9 @@
 
 namespace
 {
+// Home fits the scene; let the wheel pull back a little further than that.
+constexpr float kMaxZoomOutFactor = 1.5f;
+
 bool IsPhysicalKeyDown(int virtual_key)
 {
     return (GetAsyncKeyState(virtual_key) & 0x8000) != 0;
@@ -37,12 +40,13 @@ void ClipCursorToClient(HWND window)
 
 CameraController::CameraController()
 {
-    SetPlateSizeMm(glm::vec2(PlateDimensions::kDefaultMm));
+    SetPlateSizeMm(PlateDimensions::DefaultSizeMm());
     ResetView(16.0f / 9.0f);
 }
 
 void CameraController::Update(GLFWwindow* window, bool capture_mouse,
-                              bool capture_keyboard)
+                              bool capture_keyboard,
+                              const PanDepthProvider& pan_depth)
 {
     const HWND native_window = glfwGetWin32Window(window);
     const HWND host_window = GetAncestor(native_window, GA_ROOT);
@@ -79,6 +83,23 @@ void CameraController::Update(GLFWwindow* window, bool capture_mouse,
             last_mouse_y_ = static_cast<float>(cursor_position.y);
             ClipCursorToClient(native_window);
         }
+        if (drag_mode_ == DragMode::Pan)
+        {
+            // Match the pan scale to the surface that was grabbed. This keeps
+            // the dragged point under the cursor regardless of the orbit
+            // distance or the projection.
+            pan_reference_distance_ = camera_.Distance();
+            if (!camera_.IsOrthographic() && pan_depth)
+            {
+                double cursor_x = 0.0;
+                double cursor_y = 0.0;
+                glfwGetCursorPos(window, &cursor_x, &cursor_y);
+                if (const auto depth = pan_depth(
+                        static_cast<float>(cursor_x),
+                        static_cast<float>(cursor_y)))
+                    pan_reference_distance_ = *depth;
+            }
+        }
     }
 
     // Win32 polling is used because the GLFW window is embedded in Qt.
@@ -97,7 +118,7 @@ void CameraController::Update(GLFWwindow* window, bool capture_mouse,
             {
                 RECT client_rect{};
                 if (GetClientRect(native_window, &client_rect))
-                    camera_.Pan(delta_x, delta_y,
+                    camera_.Pan(delta_x, delta_y, pan_reference_distance_,
                                 client_rect.bottom - client_rect.top);
             }
             last_mouse_x_ = mouse_x;
@@ -122,9 +143,16 @@ void CameraController::Update(GLFWwindow* window, bool capture_mouse,
     home_was_down_ = home_down;
 }
 
-void CameraController::OnScroll(float y_offset)
+void CameraController::OnScroll(float y_offset, const glm::vec3* zoom_anchor)
 {
-    camera_.Dolly(y_offset);
+    // A camera drag holds its own scale; changing it mid-drag makes panning
+    // and orbiting jump. Ignore the wheel until the button is released.
+    if (drag_mode_ != DragMode::None)
+        return;
+    if (zoom_anchor != nullptr)
+        camera_.DollyTowards(y_offset, *zoom_anchor);
+    else
+        camera_.Dolly(y_offset);
 }
 
 void CameraController::ReleaseCursor()
@@ -134,9 +162,10 @@ void CameraController::ReleaseCursor()
     drag_mode_ = DragMode::None;
 }
 
-void CameraController::SetPlateSizeMm(const glm::vec2& size_mm)
+void CameraController::SetPlateSizeMm(const glm::vec3& size_mm)
 {
-    plate_size_world_ = size_mm / BasePlate::kMmPerWorldUnit;
+    plate_size_world_ = glm::vec2(size_mm.x, size_mm.y) /
+                        BasePlate::kMmPerWorldUnit;
     axis_lengths_world_ = BasePlate::AxisLengthsForSize(size_mm);
     SetSceneBounds(content_min_, content_max_);
 }
@@ -153,6 +182,8 @@ void CameraController::SetSceneBounds(const glm::vec3& minimum,
 
 void CameraController::ResetView(float aspect)
 {
+    // Home framing also defines how far the view may be zoomed out.
+    camera_.ClearMaxDistance();
     // Look along +Y so the plate's +X edge runs horizontally on screen.
     camera_.SetRotation(-90.0f, 35.0f);
     camera_.FrameBounds(scene_min_, scene_max_, aspect);
@@ -198,6 +229,7 @@ void CameraController::ResetView(float aspect)
     include_box({-axis_radius, -axis_radius, 0.0f},
                 {axis_radius, axis_radius, axis_lengths_world_.z});
     camera_.SetDistance(distance);
+    camera_.SetMaxDistance(distance * kMaxZoomOutFactor);
 }
 
 void CameraController::SetStandardView(StandardView view)

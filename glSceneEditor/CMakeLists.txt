@@ -26,6 +26,7 @@ set(GLAD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../3rd_party/glad")
 set(GLM_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../3rd_party/glm")
 set(ASSIMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../3rd_party/assimp")
 set(STB_IMAGE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../3rd_party/stb_image")
+set(PYSLM_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../3rd_party/pyslm_cpp")
 
 set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -46,6 +47,27 @@ else()
   message(FATAL_ERROR "This example currently uses the copied Windows Assimp binary.")
 endif()
 
+if (WIN32)
+  add_library(pyslm_cpp SHARED IMPORTED GLOBAL)
+  set_target_properties(pyslm_cpp PROPERTIES
+    INTERFACE_INCLUDE_DIRECTORIES "${PYSLM_DIR}/include"
+    IMPORTED_CONFIGURATIONS "Debug;Release;RelWithDebInfo;MinSizeRel"
+    IMPORTED_IMPLIB_DEBUG "${PYSLM_DIR}/debug/lib/pyslm_cpp.lib"
+    IMPORTED_LOCATION_DEBUG "${PYSLM_DIR}/debug/bin/pyslm_cpp.dll"
+    IMPORTED_IMPLIB_RELEASE "${PYSLM_DIR}/release/lib/pyslm_cpp.lib"
+    IMPORTED_LOCATION_RELEASE "${PYSLM_DIR}/release/bin/pyslm_cpp.dll"
+    IMPORTED_IMPLIB_RELWITHDEBINFO "${PYSLM_DIR}/release/lib/pyslm_cpp.lib"
+    IMPORTED_LOCATION_RELWITHDEBINFO "${PYSLM_DIR}/release/bin/pyslm_cpp.dll"
+    IMPORTED_IMPLIB_MINSIZEREL "${PYSLM_DIR}/release/lib/pyslm_cpp.lib"
+    IMPORTED_LOCATION_MINSIZEREL "${PYSLM_DIR}/release/bin/pyslm_cpp.dll"
+  )
+else()
+  message(FATAL_ERROR "The bundled PySLM C++ library is Windows x64 only.")
+endif()
+
+set(PYSLM_RUNTIME_DIR
+  "$<IF:$<CONFIG:Debug>,${PYSLM_DIR}/debug/bin,${PYSLM_DIR}/release/bin>")
+
 set(PROJECT_SOURCES
   "${CMAKE_CURRENT_SOURCE_DIR}/../asset/icon/toolbar_icons.qrc"
   "${IMGUIZMO_DIR}/ImGuizmo.cpp"
@@ -55,6 +77,7 @@ set(PROJECT_SOURCES
   "welcome_dialog.cpp"
   "scene_editor_window.cpp"
   "scene_viewport.cpp"
+  "slice_engine.cpp"
   "camera_controller.cpp"
   "view_cube.cpp"
   "${IMGUI_DIR}/imgui.cpp"
@@ -79,6 +102,7 @@ target_include_directories(glSceneEditor PRIVATE
   "${GLM_DIR}/include"
   "${ASSIMP_DIR}/include"
   "${STB_IMAGE_DIR}/include"
+  "${PYSLM_DIR}/include"
 )
 
 target_compile_definitions(glSceneEditor PRIVATE _CRT_SECURE_NO_WARNINGS)
@@ -90,6 +114,7 @@ target_link_libraries(glSceneEditor PRIVATE
   OpenGL::GL
   imm32
   assimp_prebuilt
+  pyslm_cpp
   Qt${QT_VERSION_MAJOR}::Widgets
   Qt${QT_VERSION_MAJOR}::Svg
 )
@@ -148,6 +173,14 @@ if (WIN32)
   endif()
 endif()
 
+# Copy the PySLM runtime last so its matching MSVC runtime wins over other
+# copies that may be placed next to the executable.
+add_custom_command(TARGET glSceneEditor POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_directory
+    "${PYSLM_RUNTIME_DIR}" "$<TARGET_FILE_DIR:glSceneEditor>"
+  COMMENT "Copying PySLM runtime files"
+)
+
 if (BUILD_TESTING)
   set(PROJECT_TEST_SOURCES ${PROJECT_SOURCES})
   list(REMOVE_ITEM PROJECT_TEST_SOURCES "main.cpp")
@@ -164,10 +197,34 @@ if (BUILD_TESTING)
   set_target_properties(project_tests PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
   add_dependencies(project_tests glSceneEditor)
+  add_custom_command(TARGET project_tests POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+      "${PYSLM_RUNTIME_DIR}" "$<TARGET_FILE_DIR:project_tests>"
+    COMMENT "Copying PySLM runtime files for tests"
+  )
   add_test(NAME project_roundtrip COMMAND project_tests)
   add_test(NAME project_ui_workflow COMMAND project_tests --ui)
   set_tests_properties(project_ui_workflow PROPERTIES TIMEOUT 45
     ENVIRONMENT "QT_QPA_PLATFORM=windows;QT_QPA_PLATFORM_PLUGIN_PATH=${_qt_bin_dir}/../plugins")
   set_tests_properties(project_roundtrip PROPERTIES TIMEOUT 45
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_QPA_PLATFORM_PLUGIN_PATH=${_qt_bin_dir}/../plugins")
+
+  add_executable(slicing_tests "tests/slicing_tests.cpp" "slice_engine.cpp")
+  target_include_directories(slicing_tests PRIVATE
+    "${APP_SOURCE_DIR}"
+    "${PYSLM_DIR}/include"
+  )
+  target_link_libraries(slicing_tests PRIVATE pyslm_cpp)
+  target_compile_definitions(slicing_tests PRIVATE _CRT_SECURE_NO_WARNINGS)
+  if (MSVC)
+    target_compile_options(slicing_tests PRIVATE /utf-8)
+  endif()
+  set_target_properties(slicing_tests PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+  add_custom_command(TARGET slicing_tests POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+      "${PYSLM_RUNTIME_DIR}" "$<TARGET_FILE_DIR:slicing_tests>"
+    COMMENT "Copying PySLM runtime files for slicing tests"
+  )
+  add_test(NAME slicing_engine COMMAND slicing_tests)
 endif()

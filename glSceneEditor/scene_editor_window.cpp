@@ -3,13 +3,16 @@
 #include <QAction>
 #include <QApplication>
 #include <QByteArray>
+#include <QCheckBox>
 #include <QColor>
 #include <QCloseEvent>
+#include <QCoreApplication>
 #include <QDir>
 #include <QDockWidget>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QDoubleSpinBox>
+#include <QEventLoop>
 #include <QFont>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -29,9 +32,11 @@
 #include <QMessageBox>
 #include <QPalette>
 #include <QPlainTextEdit>
+#include <QProgressDialog>
 #include <QPushButton>
 #include <QScrollArea>
 #include <QSignalBlocker>
+#include <QSlider>
 #include <QSplitter>
 #include <QSpinBox>
 #include <QStatusBar>
@@ -197,6 +202,20 @@ SceneEditorWindow::SceneEditorWindow(SceneViewport& viewport, const QString& pro
     history_action->setIcon(QIcon(QStringLiteral(":/icons/rotate-ccw-clock.svg")));
     connect(history_action, &QAction::triggered, this, &SceneEditorWindow::ShowOperationHistory);
 
+    QMenu* slice_menu = menuBar()->addMenu(QStringLiteral("切片(&S)"));
+    slice_action_ = slice_menu->addAction(QStringLiteral("生成切片…"));
+    slice_action_->setObjectName(QStringLiteral("generateSliceAction"));
+    slice_action_->setIcon(QIcon(QStringLiteral(":/icons/slice.svg")));
+    slice_action_->setIconText(QStringLiteral("切片"));
+    slice_action_->setToolTip(QStringLiteral("按层厚切片所有模型并预览轮廓"));
+    slice_action_->setEnabled(false);
+    connect(slice_action_, &QAction::triggered, this, &SceneEditorWindow::GenerateSlice);
+    clear_slice_action_ = slice_menu->addAction(QStringLiteral("清除切片预览"));
+    clear_slice_action_->setObjectName(QStringLiteral("clearSliceAction"));
+    clear_slice_action_->setEnabled(false);
+    connect(clear_slice_action_, &QAction::triggered,
+            this, &SceneEditorWindow::ClearSlicePreview);
+
     QMenu* view_menu = menuBar()->addMenu(QStringLiteral("视图(&V)"));
 
     QAction* reset_action = view_menu->addAction(QStringLiteral("重置视角"));
@@ -211,7 +230,7 @@ SceneEditorWindow::SceneEditorWindow(SceneViewport& viewport, const QString& pro
     plate_size_action->setObjectName(QStringLiteral("plateSizeAction"));
     plate_size_action->setIcon(QIcon(QStringLiteral(":/icons/ruler.svg")));
     plate_size_action->setIconText(QStringLiteral("平台尺寸"));
-    plate_size_action->setToolTip(QStringLiteral("修改基板长度（X）和宽度（Y），单位毫米"));
+    plate_size_action->setToolTip(QStringLiteral("修改平台长度（X）、宽度（Y）和高度（Z），单位毫米"));
     connect(plate_size_action, &QAction::triggered, this, &SceneEditorWindow::EditPlateSize);
 
     QAction* settings_action = view_menu->addAction(QStringLiteral("场景设置"));
@@ -247,11 +266,14 @@ SceneEditorWindow::SceneEditorWindow(SceneViewport& viewport, const QString& pro
     toolbar->addAction(reset_action);
     toolbar->addSeparator();
     toolbar->addAction(plate_size_action);
+    toolbar->addAction(slice_action_);
     toolbar->addAction(settings_action);
 
     CreateModelDock();
+    CreateSliceDock();
     view_menu->addSeparator();
     view_menu->addAction(model_dock_->toggleViewAction());
+    view_menu->addAction(slice_dock_->toggleViewAction());
     view_menu->addAction(toolbar->toggleViewAction());
 
     statusBar()->showMessage(QStringLiteral(
@@ -289,6 +311,7 @@ void SceneEditorWindow::UpdateProjectState()
     setWindowFilePath(project_path_);
     UpdateOperationHistory();
     UpdateModelTransformDialog();
+    UpdateSlicePanel();
 }
 
 bool SceneEditorWindow::SaveProject(bool save_as)
@@ -362,20 +385,22 @@ void SceneEditorWindow::NewProject()
 void SceneEditorWindow::OpenProject()
 {
     RenderPause pause(render_timer_, viewport_);
+    // Confirm before the native file dialog: showing a Qt message box directly
+    // inside the dialog's closing callback can leave it behind the disabled
+    // editor and make the application appear frozen.
+    if (!ConfirmSaveChanges())
+        return;
     const QString path = QFileDialog::getOpenFileName(this, QStringLiteral("打开工程"),
         ProjectFile::DefaultOpenDirectory(), ProjectFile::Filter());
     if (path.isEmpty())
         return;
+    // Let the native dialog finish unwinding before the synchronous project
+    // load; otherwise the editor can look unresponsive while it is reading.
+    statusBar()->showMessage(QStringLiteral("正在打开工程…"));
+    QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
     ProjectData project;
     QString error;
-    if (!ProjectFile::Read(path, project, error))
-    {
-        QMessageBox::warning(this, QStringLiteral("无法打开工程"), error);
-        return;
-    }
-    if (!ConfirmSaveChanges())
-        return;
-    // Saving in the prompt may have updated the very file being opened.
+    // Read after the prompt so reopening a project uses content saved there.
     if (!ProjectFile::Read(path, project, error) || !viewport_.ApplyProject(project, error))
     {
         QMessageBox::warning(this, QStringLiteral("无法打开工程"), error);
@@ -534,7 +559,7 @@ void SceneEditorWindow::ArrayModels()
 void SceneEditorWindow::EditPlateSize()
 {
     RenderPause pause(render_timer_, viewport_);
-    const glm::vec2 current = viewport_.PlateSizeMm();
+    const glm::vec3 current = viewport_.PlateSizeMm();
     QDialog dialog(this);
     dialog.setObjectName(QStringLiteral("plateSizeDialog"));
     dialog.setWindowTitle(QStringLiteral("修改平台尺寸"));
@@ -544,16 +569,21 @@ void SceneEditorWindow::EditPlateSize()
     auto* layout = new QVBoxLayout(&dialog);
     layout->setContentsMargins(24, 22, 24, 22);
     layout->setSpacing(18);
-    auto* hint = new QLabel(QStringLiteral("请输入基板尺寸（毫米）。"), &dialog);
+    auto* hint = new QLabel(
+        QStringLiteral("请输入平台尺寸（毫米）。高度（Z）只保存在工程中，"
+                       "不会在视口中显示。"),
+        &dialog);
     hint->setWordWrap(true);
     layout->addWidget(hint);
     auto* form = new QFormLayout;
     form->setVerticalSpacing(16);
     auto* length = new QDoubleSpinBox(&dialog);
     auto* width = new QDoubleSpinBox(&dialog);
+    auto* height = new QDoubleSpinBox(&dialog);
     length->setObjectName(QStringLiteral("plateLengthSpinBox"));
     width->setObjectName(QStringLiteral("plateWidthSpinBox"));
-    for (auto* field : {length, width})
+    height->setObjectName(QStringLiteral("plateHeightSpinBox"));
+    for (auto* field : {length, width, height})
     {
         field->setRange(PlateDimensions::kMinMm, PlateDimensions::kMaxMm);
         field->setDecimals(2);
@@ -563,8 +593,10 @@ void SceneEditorWindow::EditPlateSize()
     }
     length->setValue(current.x);
     width->setValue(current.y);
+    height->setValue(current.z);
     form->addRow(QStringLiteral("长度（X 方向）"), length);
     form->addRow(QStringLiteral("宽度（Y 方向）"), width);
+    form->addRow(QStringLiteral("高度（Z 方向）"), height);
     layout->addLayout(form);
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
     buttons->button(QDialogButtonBox::Ok)->setText(QStringLiteral("确定"));
@@ -575,14 +607,21 @@ void SceneEditorWindow::EditPlateSize()
     if (dialog.exec() != QDialog::Accepted)
         return;
     QString error;
-    if (!viewport_.SetPlateSizeMm({static_cast<float>(length->value()), static_cast<float>(width->value())}, error))
+    if (!viewport_.SetPlateSizeMm(
+            {static_cast<float>(length->value()),
+             static_cast<float>(width->value()),
+             static_cast<float>(height->value())}, error))
     {
         QMessageBox::warning(this, QStringLiteral("无法修改平台尺寸"), error);
         return;
     }
     UpdateProjectState();
-    const glm::vec2 size = viewport_.PlateSizeMm();
-    statusBar()->showMessage(QStringLiteral("平台尺寸：%1 × %2 mm").arg(size.x, 0, 'f', 2).arg(size.y, 0, 'f', 2));
+    const glm::vec3 size = viewport_.PlateSizeMm();
+    statusBar()->showMessage(
+        QStringLiteral("平台尺寸：%1 × %2 × %3 mm")
+            .arg(size.x, 0, 'f', 2)
+            .arg(size.y, 0, 'f', 2)
+            .arg(size.z, 0, 'f', 2));
 }
 
 void SceneEditorWindow::RememberCurrentProject()
@@ -817,7 +856,11 @@ void SceneEditorWindow::ApplyModelTransformDialog()
         transform = ModelTransformMath::RotateKeepingCenter(transform, values);
     else if (transform_dialog_mode_ == TransformMode::Scale) transform.scale = values;
     if (!viewport_.TransformModelTo(info->id, transform, transform_dialog_mode_))
-        QMessageBox::warning(transform_dialog_, QStringLiteral("无法修改模型"), QStringLiteral("参数超出支持范围，请输入有限的位移和角度，以及大于 0 的缩放倍数。"));
+        QMessageBox::warning(
+            transform_dialog_, QStringLiteral("无法修改模型"),
+            QStringLiteral("参数超出支持范围：位移后的模型位置不能超出平台范围两侧"
+                           "各一个平台尺寸（X 为 -长度～2×长度，Y、Z 同理），"
+                           "角度和位移须为有限值，缩放倍数须大于 0。"));
     UpdateModelTransformDetails();
     UpdateModelTransformDialog(true);
     UpdateProjectState();
@@ -1008,6 +1051,607 @@ void SceneEditorWindow::CreateModelDock()
     addDockWidget(Qt::LeftDockWidgetArea, model_dock_);
     resizeDocks({model_dock_}, {920}, Qt::Horizontal);
     RefreshModelList();
+}
+
+void SceneEditorWindow::CreateSliceDock()
+{
+    slice_dock_ = new QDockWidget(QStringLiteral("切片预览"), this);
+    slice_dock_->setObjectName(QStringLiteral("slicePreviewDock"));
+    slice_dock_->setAllowedAreas(Qt::LeftDockWidgetArea | Qt::RightDockWidgetArea);
+    slice_dock_->setFeatures(QDockWidget::DockWidgetClosable |
+                             QDockWidget::DockWidgetMovable);
+    slice_dock_->setMinimumWidth(320);
+
+    QWidget* contents = new QWidget(slice_dock_);
+    QVBoxLayout* layout = new QVBoxLayout(contents);
+    layout->setContentsMargins(12, 12, 12, 12);
+    layout->setSpacing(8);
+
+    QLabel* title = new QLabel(QStringLiteral("切片预览"), contents);
+    QFont title_font = title->font();
+    title_font.setBold(true);
+    title->setFont(title_font);
+    layout->addWidget(title);
+
+    slice_layer_label_ = new QLabel(QStringLiteral("尚未生成切片。"), contents);
+    slice_layer_label_->setObjectName(QStringLiteral("sliceLayerLabel"));
+    slice_layer_label_->setWordWrap(true);
+    slice_layer_label_->setTextFormat(Qt::PlainText);
+    layout->addWidget(slice_layer_label_);
+
+    slice_z_label_ = new QLabel(
+        QStringLiteral("使用“切片 → 生成切片…”开始。"), contents);
+    slice_z_label_->setObjectName(QStringLiteral("sliceZLabel"));
+    slice_z_label_->setWordWrap(true);
+    slice_z_label_->setTextFormat(Qt::PlainText);
+    layout->addWidget(slice_z_label_);
+
+    QHBoxLayout* layer_controls = new QHBoxLayout;
+    slice_slider_ = new QSlider(Qt::Horizontal, contents);
+    slice_slider_->setObjectName(QStringLiteral("sliceLayerSlider"));
+    slice_slider_->setRange(1, 1);
+    slice_slider_->setEnabled(false);
+    layer_controls->addWidget(slice_slider_, 1);
+    slice_layer_spin_ = new QSpinBox(contents);
+    slice_layer_spin_->setObjectName(QStringLiteral("sliceLayerSpin"));
+    slice_layer_spin_->setRange(1, 1);
+    slice_layer_spin_->setEnabled(false);
+    slice_layer_spin_->setFixedWidth(76);
+    layer_controls->addWidget(slice_layer_spin_);
+    layout->addLayout(layer_controls);
+
+    slice_contour_label_ = new QLabel(QString(), contents);
+    slice_contour_label_->setObjectName(QStringLiteral("sliceContourLabel"));
+    slice_contour_label_->setWordWrap(true);
+    slice_contour_label_->setTextFormat(Qt::PlainText);
+    layout->addWidget(slice_contour_label_);
+
+    slice_hatch_label_ = new QLabel(QString(), contents);
+    slice_hatch_label_->setObjectName(QStringLiteral("sliceHatchLabel"));
+    slice_hatch_label_->setWordWrap(true);
+    slice_hatch_label_->setTextFormat(Qt::PlainText);
+    layout->addWidget(slice_hatch_label_);
+
+    slice_jump_label_ = new QLabel(QString(), contents);
+    slice_jump_label_->setObjectName(QStringLiteral("sliceJumpLabel"));
+    slice_jump_label_->setWordWrap(true);
+    slice_jump_label_->setTextFormat(Qt::PlainText);
+    layout->addWidget(slice_jump_label_);
+
+    slice_total_label_ = new QLabel(QString(), contents);
+    slice_total_label_->setObjectName(QStringLiteral("sliceTotalLabel"));
+    slice_total_label_->setWordWrap(true);
+    slice_total_label_->setTextFormat(Qt::PlainText);
+    layout->addWidget(slice_total_label_);
+
+    slice_hatch_settings_label_ = new QLabel(QString(), contents);
+    slice_hatch_settings_label_->setObjectName(
+        QStringLiteral("sliceHatchSettingsLabel"));
+    slice_hatch_settings_label_->setWordWrap(true);
+    slice_hatch_settings_label_->setTextFormat(Qt::PlainText);
+    layout->addWidget(slice_hatch_settings_label_);
+
+    slice_visible_check_ = new QCheckBox(QStringLiteral("显示切片"), contents);
+    slice_visible_check_->setObjectName(QStringLiteral("sliceVisibleCheck"));
+    slice_visible_check_->setChecked(true);
+    slice_visible_check_->setEnabled(false);
+    layout->addWidget(slice_visible_check_);
+
+    slice_contour_visible_check_ =
+        new QCheckBox(QStringLiteral("显示轮廓"), contents);
+    slice_contour_visible_check_->setObjectName(
+        QStringLiteral("sliceContourVisibleCheck"));
+    slice_contour_visible_check_->setChecked(true);
+    slice_contour_visible_check_->setEnabled(false);
+    layout->addWidget(slice_contour_visible_check_);
+
+    slice_hatch_visible_check_ =
+        new QCheckBox(QStringLiteral("显示填充"), contents);
+    slice_hatch_visible_check_->setObjectName(
+        QStringLiteral("sliceHatchVisibleCheck"));
+    slice_hatch_visible_check_->setChecked(true);
+    slice_hatch_visible_check_->setEnabled(false);
+    layout->addWidget(slice_hatch_visible_check_);
+
+    slice_direction_visible_check_ =
+        new QCheckBox(QStringLiteral("显示方向"), contents);
+    slice_direction_visible_check_->setObjectName(
+        QStringLiteral("sliceDirectionVisibleCheck"));
+    slice_direction_visible_check_->setChecked(false);
+    slice_direction_visible_check_->setEnabled(false);
+    slice_direction_visible_check_->setToolTip(
+        QStringLiteral("需要开启“显示填充”才能显示方向箭头"));
+    layout->addWidget(slice_direction_visible_check_);
+
+    slice_jump_visible_check_ =
+        new QCheckBox(QStringLiteral("显示跳转"), contents);
+    slice_jump_visible_check_->setObjectName(
+        QStringLiteral("sliceJumpVisibleCheck"));
+    slice_jump_visible_check_->setChecked(false);
+    slice_jump_visible_check_->setEnabled(false);
+    slice_jump_visible_check_->setToolTip(
+        QStringLiteral("显示同一模型内相邻填充线之间的跳转"));
+    layout->addWidget(slice_jump_visible_check_);
+
+    slice_hide_models_check_ =
+        new QCheckBox(QStringLiteral("隐藏全部模型"), contents);
+    slice_hide_models_check_->setObjectName(
+        QStringLiteral("sliceHideModelsCheck"));
+    slice_hide_models_check_->setChecked(false);
+    slice_hide_models_check_->setEnabled(false);
+    slice_hide_models_check_->setToolTip(
+        QStringLiteral("只隐藏模型显示，不影响切片数据"));
+    layout->addWidget(slice_hide_models_check_);
+
+    QHBoxLayout* button_row = new QHBoxLayout;
+    slice_reslice_button_ = new QPushButton(QStringLiteral("重新切片…"), contents);
+    slice_reslice_button_->setObjectName(QStringLiteral("sliceResliceButton"));
+    slice_reslice_button_->setEnabled(false);
+    button_row->addWidget(slice_reslice_button_);
+    slice_clear_button_ = new QPushButton(QStringLiteral("清除"), contents);
+    slice_clear_button_->setObjectName(QStringLiteral("sliceClearButton"));
+    slice_clear_button_->setEnabled(false);
+    button_row->addWidget(slice_clear_button_);
+    layout->addLayout(button_row);
+
+    QLabel* note = new QLabel(
+        QStringLiteral("仅预览当前层轮廓、填充、方向和跳转，不写入工程，也不导出文件。"),
+        contents);
+    note->setWordWrap(true);
+    note->setTextFormat(Qt::PlainText);
+    layout->addWidget(note);
+    layout->addStretch(1);
+
+    slice_dock_->setWidget(contents);
+    addDockWidget(Qt::RightDockWidgetArea, slice_dock_);
+    resizeDocks({slice_dock_}, {360}, Qt::Horizontal);
+    slice_dock_->hide();
+
+    auto set_layer = [this](int value)
+    {
+        if (viewport_.SetSliceLayer(static_cast<std::size_t>(value)))
+            UpdateSlicePanel(true);
+    };
+    connect(slice_slider_, &QSlider::valueChanged, this, set_layer);
+    connect(slice_layer_spin_, QOverload<int>::of(&QSpinBox::valueChanged),
+            this, set_layer);
+    connect(slice_visible_check_, &QCheckBox::toggled, this, [this](bool checked)
+    {
+        viewport_.SetSlicePreviewVisible(checked);
+        UpdateSlicePanel(true);
+    });
+    connect(slice_contour_visible_check_, &QCheckBox::toggled, this,
+            [this](bool checked)
+    {
+        viewport_.SetSliceContoursVisible(checked);
+        UpdateSlicePanel(true);
+    });
+    connect(slice_hatch_visible_check_, &QCheckBox::toggled, this,
+            [this](bool checked)
+    {
+        viewport_.SetSliceHatchesVisible(checked);
+        UpdateSlicePanel(true);
+    });
+    connect(slice_direction_visible_check_, &QCheckBox::toggled, this,
+            [this](bool checked)
+    {
+        viewport_.SetSliceDirectionVisible(checked);
+        UpdateSlicePanel(true);
+    });
+    connect(slice_jump_visible_check_, &QCheckBox::toggled, this,
+            [this](bool checked)
+    {
+        viewport_.SetSliceJumpsVisible(checked);
+        UpdateSlicePanel(true);
+    });
+    connect(slice_hide_models_check_, &QCheckBox::toggled, this,
+            [this](bool checked)
+    {
+        viewport_.SetModelsHidden(checked);
+        UpdateSlicePanel(true);
+    });
+    connect(slice_reslice_button_, &QPushButton::clicked,
+            this, &SceneEditorWindow::GenerateSlice);
+    connect(slice_clear_button_, &QPushButton::clicked,
+            this, &SceneEditorWindow::ClearSlicePreview);
+    UpdateSlicePanel(true);
+}
+
+void SceneEditorWindow::UpdateSlicePanel(bool force)
+{
+    if (!slice_action_ || !clear_slice_action_ || !slice_dock_)
+        return;
+
+    const bool can_slice = viewport_.ModelCount() > 0 &&
+                           !viewport_.IsTransformEditing();
+    slice_action_->setEnabled(can_slice);
+
+    if (viewport_.ConsumeSliceInvalidation())
+        statusBar()->showMessage(QStringLiteral("模型已变更，切片预览已清除。"));
+
+    const auto info = viewport_.SliceInfo();
+    clear_slice_action_->setEnabled(info.has_preview);
+    if (slice_hide_models_check_)
+        slice_hide_models_check_->setEnabled(
+            info.has_preview && !viewport_.IsTransformEditing());
+    const auto revision = viewport_.SliceRevision();
+    if (!force && revision == last_slice_revision_)
+        return;
+    last_slice_revision_ = revision;
+
+    if (!info.has_preview)
+    {
+        slice_had_preview_ = false;
+        if (slice_dock_->isVisible())
+            slice_dock_->hide();
+        slice_layer_label_->setText(QStringLiteral("尚未生成切片。"));
+        slice_z_label_->setText(
+            QStringLiteral("使用“切片 → 生成切片…”开始。"));
+        slice_contour_label_->clear();
+        slice_hatch_label_->clear();
+        slice_jump_label_->clear();
+        slice_total_label_->clear();
+        slice_hatch_settings_label_->clear();
+        const QSignalBlocker slider_blocker(slice_slider_);
+        const QSignalBlocker spin_blocker(slice_layer_spin_);
+        const QSignalBlocker check_blocker(slice_visible_check_);
+        const QSignalBlocker contour_check_blocker(slice_contour_visible_check_);
+        const QSignalBlocker hatch_check_blocker(slice_hatch_visible_check_);
+        const QSignalBlocker direction_check_blocker(
+            slice_direction_visible_check_);
+        const QSignalBlocker jump_check_blocker(slice_jump_visible_check_);
+        const QSignalBlocker hide_models_blocker(slice_hide_models_check_);
+        slice_slider_->setRange(1, 1);
+        slice_layer_spin_->setRange(1, 1);
+        slice_slider_->setValue(1);
+        slice_layer_spin_->setValue(1);
+        slice_slider_->setEnabled(false);
+        slice_layer_spin_->setEnabled(false);
+        slice_visible_check_->setChecked(false);
+        slice_visible_check_->setEnabled(false);
+        slice_contour_visible_check_->setChecked(false);
+        slice_contour_visible_check_->setEnabled(false);
+        slice_hatch_visible_check_->setChecked(false);
+        slice_hatch_visible_check_->setEnabled(false);
+        slice_direction_visible_check_->setChecked(false);
+        slice_direction_visible_check_->setEnabled(false);
+        slice_jump_visible_check_->setChecked(false);
+        slice_jump_visible_check_->setEnabled(false);
+        slice_hide_models_check_->setChecked(false);
+        slice_hide_models_check_->setEnabled(false);
+        slice_reslice_button_->setEnabled(false);
+        slice_clear_button_->setEnabled(false);
+        return;
+    }
+
+    if (!slice_had_preview_)
+    {
+        slice_dock_->show();
+        slice_dock_->raise();
+    }
+    slice_had_preview_ = true;
+
+    slice_layer_label_->setText(
+        QStringLiteral("第 %1 / %2 个有效层")
+            .arg(static_cast<qulonglong>(info.layer_index))
+            .arg(static_cast<qulonglong>(info.layer_count)));
+    slice_z_label_->setText(
+        QStringLiteral("Z = %1 mm").arg(QLocale().toString(info.z_mm, 'f', 3)));
+    slice_contour_label_->setText(
+        QStringLiteral("本层轮廓：%1 条 | 路径长：%2 mm")
+            .arg(static_cast<qulonglong>(info.contour_count))
+            .arg(QLocale().toString(info.layer_contour_path_length_mm, 'f', 2)));
+    if (info.hatch.enabled)
+    {
+        slice_hatch_label_->setText(
+            QStringLiteral("本层填充：%1 条 | 路径长：%2 mm")
+                .arg(static_cast<qulonglong>(info.hatch_count))
+                .arg(QLocale().toString(info.layer_hatch_path_length_mm, 'f', 2)));
+        slice_hatch_settings_label_->setText(
+            QStringLiteral("填充：%1 mm / %2° / %3°/层")
+                .arg(QLocale().toString(info.hatch.spacing_mm, 'f', 3))
+                .arg(QLocale().toString(info.hatch.angle_deg, 'f', 1))
+                .arg(QLocale().toString(
+                    info.hatch.layer_angle_increment_deg, 'f', 1)));
+    }
+    else
+    {
+        slice_hatch_label_->setText(QStringLiteral("本层填充：未启用"));
+        slice_hatch_settings_label_->setText(QStringLiteral("填充：未启用"));
+    }
+    slice_jump_label_->setText(
+        QStringLiteral("本层跳转：%1 次 | 总长 %2 mm")
+            .arg(static_cast<qulonglong>(info.jump_count))
+            .arg(QLocale().toString(info.layer_jump_path_length_mm, 'f', 2)));
+    slice_total_label_->setText(
+        QStringLiteral("轮廓总长：%1 mm | 填充总长：%2 mm\n总路径长：%3 mm")
+            .arg(QLocale().toString(info.total_contour_path_length_mm, 'f', 2))
+            .arg(QLocale().toString(info.total_hatch_path_length_mm, 'f', 2))
+            .arg(QLocale().toString(info.total_path_length_mm, 'f', 2)));
+
+    const int layer_count = static_cast<int>(info.layer_count);
+    const int layer_index = static_cast<int>(info.layer_index);
+    {
+        const QSignalBlocker slider_blocker(slice_slider_);
+        const QSignalBlocker spin_blocker(slice_layer_spin_);
+        const QSignalBlocker check_blocker(slice_visible_check_);
+        const QSignalBlocker contour_check_blocker(slice_contour_visible_check_);
+        const QSignalBlocker hatch_check_blocker(slice_hatch_visible_check_);
+        const QSignalBlocker direction_check_blocker(
+            slice_direction_visible_check_);
+        const QSignalBlocker jump_check_blocker(slice_jump_visible_check_);
+        const QSignalBlocker hide_models_blocker(slice_hide_models_check_);
+        slice_slider_->setRange(1, layer_count);
+        slice_layer_spin_->setRange(1, layer_count);
+        slice_slider_->setValue(layer_index);
+        slice_layer_spin_->setValue(layer_index);
+        slice_slider_->setEnabled(layer_count > 1);
+        slice_layer_spin_->setEnabled(layer_count > 1);
+        slice_visible_check_->setChecked(info.visible);
+        slice_visible_check_->setEnabled(true);
+        slice_contour_visible_check_->setChecked(info.contours_visible);
+        slice_contour_visible_check_->setEnabled(info.contour_count > 0);
+        slice_hatch_visible_check_->setChecked(
+            info.hatch.enabled && info.hatches_visible);
+        slice_hatch_visible_check_->setEnabled(
+            info.hatch.enabled && info.hatch_count > 0);
+        slice_direction_visible_check_->setChecked(info.direction_visible);
+        slice_direction_visible_check_->setEnabled(
+            info.hatch.enabled && info.hatch_count > 0 &&
+            info.hatches_visible);
+        slice_jump_visible_check_->setChecked(info.jumps_visible);
+        slice_jump_visible_check_->setEnabled(
+            info.hatch.enabled && info.hatch_count > 0);
+        slice_hide_models_check_->setChecked(info.models_hidden);
+        slice_hide_models_check_->setEnabled(!viewport_.IsTransformEditing());
+    }
+    slice_reslice_button_->setEnabled(can_slice);
+    slice_clear_button_->setEnabled(true);
+}
+
+void SceneEditorWindow::GenerateSlice()
+{
+    if (viewport_.ModelCount() == 0)
+    {
+        QMessageBox::information(this, QStringLiteral("生成切片"),
+            QStringLiteral("请先导入至少一个 STL 模型。"));
+        return;
+    }
+    if (viewport_.IsTransformEditing())
+    {
+        QMessageBox::information(this, QStringLiteral("生成切片"),
+            QStringLiteral("请先关闭模型变换参数窗口。"));
+        return;
+    }
+
+    RenderPause pause(render_timer_, viewport_);
+
+    QDialog dialog(this);
+    dialog.setObjectName(QStringLiteral("sliceSettingsDialog"));
+    dialog.setWindowTitle(QStringLiteral("生成切片"));
+    dialog.setWindowFlag(Qt::WindowContextHelpButtonHint, false);
+    dialog.setFont(QFont(QStringLiteral("Microsoft YaHei"), 11));
+    dialog.setMinimumWidth(460);
+
+    QVBoxLayout* layout = new QVBoxLayout(&dialog);
+    layout->setContentsMargins(22, 20, 22, 20);
+    layout->setSpacing(14);
+    QFormLayout* form = new QFormLayout;
+    auto* thickness = new QDoubleSpinBox(&dialog);
+    thickness->setObjectName(QStringLiteral("sliceLayerThicknessSpin"));
+    thickness->setRange(kMinLayerThicknessMm, kMaxLayerThicknessMm);
+    thickness->setDecimals(3);
+    thickness->setSingleStep(0.01);
+    thickness->setSuffix(QStringLiteral(" mm"));
+    thickness->setValue(slice_layer_thickness_mm_);
+    form->addRow(QStringLiteral("层厚"), thickness);
+    QLabel* estimate_label = new QLabel(&dialog);
+    estimate_label->setWordWrap(true);
+    estimate_label->setTextFormat(Qt::PlainText);
+    form->addRow(QStringLiteral("预计"), estimate_label);
+    layout->addLayout(form);
+
+    QGroupBox* hatch_group = new QGroupBox(QStringLiteral("填充"), &dialog);
+    hatch_group->setObjectName(QStringLiteral("sliceHatchGroup"));
+    QVBoxLayout* hatch_layout = new QVBoxLayout(hatch_group);
+    QCheckBox* hatch_enabled =
+        new QCheckBox(QStringLiteral("启用填充"), hatch_group);
+    hatch_enabled->setObjectName(QStringLiteral("sliceHatchEnabledCheck"));
+    hatch_enabled->setChecked(slice_hatch_enabled_);
+    hatch_layout->addWidget(hatch_enabled);
+    QFormLayout* hatch_form = new QFormLayout;
+    auto* hatch_spacing = new QDoubleSpinBox(hatch_group);
+    hatch_spacing->setObjectName(QStringLiteral("sliceHatchSpacingSpin"));
+    hatch_spacing->setRange(kMinHatchSpacingMm, kMaxHatchSpacingMm);
+    hatch_spacing->setDecimals(3);
+    hatch_spacing->setSingleStep(0.01);
+    hatch_spacing->setSuffix(QStringLiteral(" mm"));
+    hatch_spacing->setValue(slice_hatch_spacing_mm_);
+    hatch_form->addRow(QStringLiteral("扫描间距"), hatch_spacing);
+    auto* hatch_angle = new QDoubleSpinBox(hatch_group);
+    hatch_angle->setObjectName(QStringLiteral("sliceHatchAngleSpin"));
+    hatch_angle->setRange(0.0, 180.0);
+    hatch_angle->setDecimals(1);
+    hatch_angle->setSingleStep(1.0);
+    hatch_angle->setSuffix(QStringLiteral(" °"));
+    hatch_angle->setValue(slice_hatch_angle_deg_);
+    hatch_form->addRow(QStringLiteral("扫描角度"), hatch_angle);
+    auto* hatch_increment = new QDoubleSpinBox(hatch_group);
+    hatch_increment->setObjectName(
+        QStringLiteral("sliceHatchLayerIncrementSpin"));
+    hatch_increment->setRange(-180.0, 180.0);
+    hatch_increment->setDecimals(1);
+    hatch_increment->setSingleStep(1.0);
+    hatch_increment->setSuffix(QStringLiteral(" °/层"));
+    hatch_increment->setValue(slice_hatch_layer_increment_deg_);
+    hatch_form->addRow(QStringLiteral("层间角度增量"), hatch_increment);
+    hatch_layout->addLayout(hatch_form);
+    layout->addWidget(hatch_group);
+    auto update_hatch_fields = [hatch_enabled, hatch_spacing,
+                                hatch_angle, hatch_increment]()
+    {
+        const bool enabled = hatch_enabled->isChecked();
+        hatch_spacing->setEnabled(enabled);
+        hatch_angle->setEnabled(enabled);
+        hatch_increment->setEnabled(enabled);
+    };
+    connect(hatch_enabled, &QCheckBox::toggled, &dialog,
+            [update_hatch_fields](bool) { update_hatch_fields(); });
+    update_hatch_fields();
+
+    QLabel* note = new QLabel(
+        QStringLiteral("按平台坐标切片所有模型（包括隐藏模型）；只生成轮廓和填充预览，"
+                       "不导出文件，也不进入撤销记录。模型低于 Z=0 的部分不切。"
+                       "填充线会穿透模型显示。"),
+        &dialog);
+    note->setWordWrap(true);
+    note->setTextFormat(Qt::PlainText);
+    layout->addWidget(note);
+
+    auto update_estimate = [&]()
+    {
+        const double layer_thickness = thickness->value();
+        double max_z_mm = 0.0;
+        for (const auto& info : viewport_.ModelInfos())
+            max_z_mm = std::max(max_z_mm,
+                static_cast<double>(info.world_bounds_max_mm.z));
+        const std::size_t layers =
+            layer_thickness > 0.0 && max_z_mm > 0.0
+                ? static_cast<std::size_t>(std::ceil(max_z_mm / layer_thickness))
+                : 0;
+        estimate_label->setText(
+            QStringLiteral("预计有效层数上限：%1")
+                .arg(static_cast<qulonglong>(layers)));
+    };
+    connect(thickness, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+            &dialog, [&](double) { update_estimate(); });
+    update_estimate();
+
+    QDialogButtonBox* buttons = new QDialogButtonBox(
+        QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    if (QPushButton* ok_button = buttons->button(QDialogButtonBox::Ok))
+        ok_button->setText(QStringLiteral("生成"));
+    if (QPushButton* cancel_button = buttons->button(QDialogButtonBox::Cancel))
+        cancel_button->setText(QStringLiteral("取消"));
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    layout->addWidget(buttons);
+
+    if (dialog.exec() != QDialog::Accepted)
+        return;
+
+    const double layer_thickness = thickness->value();
+    slice_layer_thickness_mm_ = layer_thickness;
+    slice_hatch_enabled_ = hatch_enabled->isChecked();
+    slice_hatch_spacing_mm_ = hatch_spacing->value();
+    slice_hatch_angle_deg_ = hatch_angle->value();
+    slice_hatch_layer_increment_deg_ = hatch_increment->value();
+
+    SliceSettings settings;
+    settings.layer_thickness_mm = layer_thickness;
+    settings.hatch.enabled = slice_hatch_enabled_;
+    settings.hatch.spacing_mm = slice_hatch_spacing_mm_;
+    settings.hatch.angle_deg = slice_hatch_angle_deg_;
+    settings.hatch.layer_angle_increment_deg = slice_hatch_layer_increment_deg_;
+    settings.hatch.spot_compensation_mm = 0.08;
+
+    SceneViewport::SliceEstimate estimate;
+    QString error;
+    if (!viewport_.PrepareSlice(settings, estimate, error))
+    {
+        QMessageBox::warning(this, QStringLiteral("无法生成切片"), error);
+        return;
+    }
+
+    if (estimate.estimated_layers > 5000 || estimate.triangle_count > 2000000)
+    {
+        const auto answer = QMessageBox::question(this,
+            QStringLiteral("切片耗时提示"),
+            QStringLiteral("预计最多 %1 个有效层、共 %2 个三角面，切片可能耗时较长。是否继续？")
+                .arg(static_cast<qulonglong>(estimate.estimated_layers))
+                .arg(static_cast<qulonglong>(estimate.triangle_count)),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+        if (answer != QMessageBox::Yes)
+            return;
+    }
+
+    QProgressDialog progress(QStringLiteral("正在切片，请稍候…"),
+                             QStringLiteral("取消"), 0, 100, this);
+    progress.setWindowTitle(QStringLiteral("切片"));
+    progress.setWindowModality(Qt::WindowModal);
+    progress.setMinimumDuration(0);
+    progress.setAutoClose(false);
+    progress.setAutoReset(false);
+    progress.setValue(0);
+    progress.show();
+    QCoreApplication::processEvents();
+
+    auto progress_callback = [&progress](std::size_t completed,
+                                         std::size_t total) -> bool
+    {
+        if (progress.wasCanceled())
+            return false;
+        if (total > 0)
+        {
+            const int maximum = static_cast<int>(
+                std::min<std::size_t>(
+                    total, static_cast<std::size_t>(std::numeric_limits<int>::max())));
+            if (progress.maximum() != maximum)
+                progress.setMaximum(maximum);
+            progress.setValue(static_cast<int>(
+                std::min<std::size_t>(completed,
+                    static_cast<std::size_t>(maximum))));
+        }
+        QCoreApplication::processEvents();
+        return !progress.wasCanceled();
+    };
+
+    bool cancelled = false;
+    QStringList issues;
+    const bool ok = viewport_.GenerateSlice(
+        settings, progress_callback, cancelled, error, issues);
+    progress.close();
+
+    if (cancelled)
+    {
+        statusBar()->showMessage(QStringLiteral("已取消切片，预览未更新。"));
+        return;
+    }
+    if (!ok)
+    {
+        QMessageBox::warning(this, QStringLiteral("无法生成切片"),
+            error.isEmpty() ? QStringLiteral("没有生成任何有效切片。") : error);
+        return;
+    }
+
+    last_slice_revision_ = 0;
+    UpdateSlicePanel(true);
+    slice_dock_->show();
+    slice_dock_->raise();
+    const auto info = viewport_.SliceInfo();
+    statusBar()->showMessage(
+        QStringLiteral("切片完成：%1 个有效层 | 轮廓 %2 mm | 填充 %3 mm | 总长 %4 mm")
+            .arg(static_cast<qulonglong>(info.layer_count))
+            .arg(QLocale().toString(info.total_contour_path_length_mm, 'f', 2))
+            .arg(QLocale().toString(info.total_hatch_path_length_mm, 'f', 2))
+            .arg(QLocale().toString(info.total_path_length_mm, 'f', 2)));
+    if (!issues.isEmpty())
+        QMessageBox::warning(this, QStringLiteral("部分模型未生成切片"),
+            issues.join(QStringLiteral("\n")));
+}
+
+void SceneEditorWindow::ClearSlicePreview()
+{
+    if (!viewport_.SliceInfo().has_preview)
+        return;
+    RenderPause pause(render_timer_, viewport_);
+    viewport_.ClearSlicePreview();
+    slice_had_preview_ = false;
+    last_slice_revision_ = 0;
+    if (slice_dock_->isVisible())
+        slice_dock_->hide();
+    UpdateSlicePanel(true);
+    statusBar()->showMessage(QStringLiteral("已清除切片预览。"));
 }
 
 void SceneEditorWindow::RefreshModelList()

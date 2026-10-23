@@ -23,7 +23,7 @@ struct ProjectModel
 struct ProjectData
 {
     std::vector<ProjectModel> models;
-    glm::vec2 plate_size_mm{PlateDimensions::kDefaultMm};
+    glm::vec3 plate_size_mm = PlateDimensions::DefaultSizeMm();
 };
 
 namespace ProjectFile

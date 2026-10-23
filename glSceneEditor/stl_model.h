@@ -19,6 +19,7 @@
 
 #include "base_plate.h"
 #include "shader.h"
+#include "slice_engine.h"
 
 // STL coordinates are interpreted as millimeters. The model is centered on
 // the plate in X/Y, and its lowest Z point is placed on the plate (Z = 0).
@@ -229,6 +230,27 @@ public:
     std::size_t TriangleCount() const
     {
         return static_cast<std::size_t>(vertex_count_) / 3;
+    }
+
+    // Export the placed mesh in build-plate millimeters for the slicer. The
+    // model transform is baked into the vertices so pyslm only sees geometry
+    // that matches what the user sees on the plate.
+    void AppendBuildTrianglesMm(std::vector<SliceTriangle>& triangles) const
+    {
+        const glm::mat4 to_mm = glm::scale(
+            glm::mat4(1.0f), glm::vec3(BasePlate::kMmPerWorldUnit)) *
+            ModelMatrix();
+        triangles.reserve(triangles.size() + pick_vertices_.size() / 3);
+        for (std::size_t i = 0; i + 2 < pick_vertices_.size(); i += 3)
+        {
+            SliceTriangle triangle;
+            for (int corner = 0; corner < 3; ++corner)
+            {
+                const glm::vec4 point = to_mm * glm::vec4(pick_vertices_[i + corner], 1.0f);
+                triangle.vertices[corner] = {point.x, point.y, point.z};
+            }
+            triangles.push_back(triangle);
+        }
     }
 
     void GetWorldBounds(glm::vec3& minimum, glm::vec3& maximum) const

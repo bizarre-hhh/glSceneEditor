@@ -75,8 +75,14 @@ public:
     void SetTarget(const glm::vec3& target) { target_ = target; }
     void SetDistance(float distance)
     {
-        distance_ = glm::clamp(distance, 0.05f, 100000.0f);
+        distance_ = glm::clamp(distance, kMinDistance, max_distance_);
     }
+    // Home framing uses this to bound how far the user can zoom out.
+    void SetMaxDistance(float distance)
+    {
+        max_distance_ = glm::clamp(distance, kMinDistance, kMaxDistance);
+    }
+    void ClearMaxDistance() { max_distance_ = kMaxDistance; }
     void SetZoom(float zoom) { zoom_ = glm::clamp(zoom, 1.0f, 90.0f); }
     void SetRotation(float yaw, float pitch)
     {
@@ -93,23 +99,47 @@ public:
                     pitch_ - y_pixels * 0.25f);
     }
 
-    void Pan(float x_pixels, float y_pixels, int viewport_height)
+    // reference_distance is the view-space depth of the surface being
+    // dragged, so the grabbed point follows the mouse exactly. The orbit
+    // distance is only a fallback when there is no surface under the cursor.
+    void Pan(float x_pixels, float y_pixels, float reference_distance,
+             int viewport_height)
     {
-        if (viewport_height <= 0)
+        if (viewport_height <= 0 || reference_distance <= 0.0f)
             return;
         const glm::vec3 front = glm::normalize(target_ - Position());
         const glm::vec3 right = glm::normalize(
             glm::cross(front, UpDirection()));
         const glm::vec3 up = glm::cross(right, front);
         const float world_units_per_pixel =
-            2.0f * distance_ * std::tan(glm::radians(zoom_) * 0.5f) /
+            2.0f * reference_distance * std::tan(glm::radians(zoom_) * 0.5f) /
             static_cast<float>(viewport_height);
         target_ += (-right * x_pixels + up * y_pixels) * world_units_per_pixel;
     }
 
     void Dolly(float wheel_steps)
     {
-        SetDistance(distance_ * std::pow(0.85f, wheel_steps));
+        SetDistance(distance_ * std::pow(kWheelZoomStep, wheel_steps));
+    }
+
+    // Zoom toward a point on the scene instead of the fixed orbit target.
+    // Both the camera and the target move toward the anchor so it stays under
+    // the cursor and keeps growing at the wheel's exponential rate. Zooming
+    // toward a target in front of the geometry would slow down and stall, as
+    // the camera can never pass it.
+    void DollyTowards(float wheel_steps, const glm::vec3& anchor)
+    {
+        if (orthographic_)
+        {
+            Dolly(wheel_steps);
+            return;
+        }
+        const float next_distance = glm::clamp(
+            distance_ * std::pow(kWheelZoomStep, wheel_steps),
+            kMinDistance, max_distance_);
+        const float applied = next_distance / distance_;
+        target_ += (1.0f - applied) * (anchor - target_);
+        distance_ = next_distance;
     }
 
     void FrameBounds(const glm::vec3& minimum, const glm::vec3& maximum,
@@ -126,8 +156,13 @@ public:
     }
 
 private:
+    static constexpr float kMinDistance = 0.05f;
+    static constexpr float kMaxDistance = 100000.0f;
+    static constexpr float kWheelZoomStep = 0.85f;
+
     glm::vec3 target_{0.0f};
     float distance_ = 20.0f;
+    float max_distance_ = kMaxDistance;
     float yaw_ = 0.0f;
     float pitch_ = 35.0f;
     float zoom_ = 45.0f;

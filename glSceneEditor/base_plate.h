@@ -20,23 +20,28 @@ public:
     static constexpr float kMmPerWorldUnit = 10.0f;
     static constexpr float kHorizontalAxisZ = 0.065f;
 
-    explicit BasePlate(const glm::vec2& size_mm = glm::vec2(PlateDimensions::kDefaultMm))
+    explicit BasePlate(const glm::vec3& size_mm = PlateDimensions::DefaultSizeMm())
     {
         SetSize(size_mm);
     }
     ~BasePlate() { Release(); }
 
-    glm::vec2 SizeMm() const { return size_mm_; }
-    glm::vec2 SizeWorld() const { return size_mm_ / kMmPerWorldUnit; }
-    static glm::vec3 AxisLengthsForSize(const glm::vec2& size_mm)
+    glm::vec2 SizeMm() const { return glm::vec2(size_mm_.x, size_mm_.y); }
+    glm::vec2 SizeWorld() const
     {
-        const glm::vec2 size = size_mm / kMmPerWorldUnit;
-        return {1.2f * size.x, 1.2f * size.y, 1.2f * std::max(size.x, size.y)};
+        return glm::vec2(size_mm_.x, size_mm_.y) / kMmPerWorldUnit;
+    }
+    // Each axis extends 20% beyond its own platform dimension, so the Z axis
+    // depends only on the platform height.
+    static glm::vec3 AxisLengthsForSize(const glm::vec3& size_mm)
+    {
+        const glm::vec3 size = size_mm / kMmPerWorldUnit;
+        return {1.2f * size.x, 1.2f * size.y, 1.2f * size.z};
     }
     glm::vec3 AxisLengthsWorld() const { return AxisLengthsForSize(size_mm_); }
 
     // Reuse the same OpenGL buffers when changing the rectangular plate.
-    void SetSize(const glm::vec2& size_mm)
+    void SetSize(const glm::vec3& size_mm)
     {
         size_mm_ = size_mm;
         const glm::vec2 size = SizeWorld();
@@ -87,6 +92,34 @@ public:
         AddAxis(axes, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, axis_lengths.z}, kZColor);
         axis_vertex_count_ = static_cast<GLsizei>(axes.size() / 6);
         Upload(axes, axis_vao_, axis_vbo_);
+
+        // Square markers at the platform's maximum X, Y and Z coordinates,
+        // each extending only into the platform's positive quadrant. A small
+        // thickness keeps them visible edge-on in orthographic views.
+        std::vector<float> markers;
+        const float height = size_mm_.z / kMmPerWorldUnit;
+        const float shortest_axis = std::min(axis_lengths.x, axis_lengths.y);
+        const float cone_radius =
+            std::min(kAxisConeRadius, 0.12f * shortest_axis);
+        const float marker_size =
+            std::max(0.06f * std::min(length, width), 1.2f * cone_radius);
+        const float marker_half_thickness = 0.04f * marker_size;
+        const auto add_marker = [&](const glm::vec3& center,
+                                    const glm::vec3& normal,
+                                    const glm::vec3& u, const glm::vec3& v)
+        {
+            AddSquareMarker(markers, center, normal, u, v, marker_size,
+                            marker_half_thickness, kMarkerColor,
+                            kMarkerRimColor);
+        };
+        add_marker({length, 0.0f, kHorizontalAxisZ}, {1.0f, 0.0f, 0.0f},
+                   {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 1.0f});
+        add_marker({0.0f, width, kHorizontalAxisZ}, {0.0f, 1.0f, 0.0f},
+                   {0.0f, 0.0f, 1.0f}, {1.0f, 0.0f, 0.0f});
+        add_marker({0.0f, 0.0f, height}, {0.0f, 0.0f, 1.0f},
+                   {1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f});
+        marker_vertex_count_ = static_cast<GLsizei>(markers.size() / 6);
+        Upload(markers, marker_vao_, marker_vbo_);
     }
 
     void Draw(Shader& shader, const glm::mat4& view,
@@ -122,13 +155,33 @@ public:
         shader.setFloat("zOffset", viewed_from_below ? -0.006f : 0.0f);
         glBindVertexArray(line_vao_);
         glDrawArrays(GL_LINES, 0, line_vertex_count_);
-        glBindVertexArray(0);
 
-        if (viewed_from_below)
+        // Draw the platform-extent markers last so they blend over the axes.
+        if (!viewed_from_below)
         {
-            glDepthMask(GL_TRUE);
-            glDisable(GL_BLEND);
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glDepthMask(GL_FALSE);
         }
+        shader.setFloat("zOffset", 0.0f);
+        shader.setFloat("alpha", 0.7f);
+        const GLboolean cull_was_enabled = glIsEnabled(GL_CULL_FACE);
+        glEnable(GL_CULL_FACE);
+        glCullFace(GL_BACK);
+        glBindVertexArray(marker_vao_);
+        const GLsizei vertices_per_marker = marker_vertex_count_ / 3;
+        // A marker follows its axis: hidden when the axis points at the eye
+        // in an orthographic view. The thickness keeps edge-on markers of
+        // visible axes readable.
+        for (int axis = 0; axis < 3; ++axis)
+            if (camera.IsAxisVisible(axis_directions[axis]))
+                glDrawArrays(GL_TRIANGLES, axis * vertices_per_marker,
+                             vertices_per_marker);
+        glBindVertexArray(0);
+        if (!cull_was_enabled)
+            glDisable(GL_CULL_FACE);
+        glDepthMask(GL_TRUE);
+        glDisable(GL_BLEND);
     }
 
     // Call while the OpenGL context is still current.
@@ -137,11 +190,13 @@ public:
         glDeleteBuffers(1, &face_vbo_);
         glDeleteBuffers(1, &line_vbo_);
         glDeleteBuffers(1, &axis_vbo_);
+        glDeleteBuffers(1, &marker_vbo_);
         glDeleteVertexArrays(1, &face_vao_);
         glDeleteVertexArrays(1, &line_vao_);
         glDeleteVertexArrays(1, &axis_vao_);
-        face_vbo_ = line_vbo_ = axis_vbo_ = 0;
-        face_vao_ = line_vao_ = axis_vao_ = 0;
+        glDeleteVertexArrays(1, &marker_vao_);
+        face_vbo_ = line_vbo_ = axis_vbo_ = marker_vbo_ = 0;
+        face_vao_ = line_vao_ = axis_vao_ = marker_vao_ = 0;
     }
 
     BasePlate(const BasePlate&) = delete;
@@ -155,6 +210,8 @@ private:
     inline static const glm::vec3 kXColor{0.96f, 0.20f, 0.22f};
     inline static const glm::vec3 kYColor{0.18f, 0.80f, 0.30f};
     inline static const glm::vec3 kZColor{0.25f, 0.51f, 0.98f};
+    inline static const glm::vec3 kMarkerColor{0.78f, 0.81f, 0.85f};
+    inline static const glm::vec3 kMarkerRimColor{0.34f, 0.37f, 0.42f};
 
     static glm::vec3 AxisRadial(const glm::vec3& direction, float angle)
     {
@@ -213,6 +270,73 @@ private:
         }
     }
 
+    // A short two-sided square marker extending into the positive quadrant
+    // from its axis corner, with translucent faces and a darker border.
+    static void AddSquareMarker(std::vector<float>& data,
+                                const glm::vec3& center,
+                                const glm::vec3& normal,
+                                const glm::vec3& u, const glm::vec3& v,
+                                float side, float half_thickness,
+                                const glm::vec3& face_color,
+                                const glm::vec3& edge_color)
+    {
+        constexpr float kBorderRatio = 0.08f;
+        const glm::vec3 n = glm::normalize(normal);
+        const float border = kBorderRatio * side;
+        const glm::vec2 offsets[4] = {
+            {0.0f, 0.0f}, {side, 0.0f}, {side, side}, {0.0f, side}};
+        const glm::vec2 inner_offsets[4] = {
+            {border, border},
+            {side - border, border},
+            {side - border, side - border},
+            {border, side - border}};
+        const auto point = [&](const glm::vec2& offset, float depth)
+        {
+            return center + u * offset.x + v * offset.y + n * depth;
+        };
+
+        glm::vec3 front_outer[4];
+        glm::vec3 back_outer[4];
+        glm::vec3 front_inner[4];
+        glm::vec3 back_inner[4];
+        for (int corner = 0; corner < 4; ++corner)
+        {
+            front_outer[corner] = point(offsets[corner], half_thickness);
+            back_outer[corner] = point(offsets[corner], -half_thickness);
+            front_inner[corner] = point(inner_offsets[corner], half_thickness);
+            back_inner[corner] = point(inner_offsets[corner], -half_thickness);
+        }
+
+        // Inner faces.
+        AddTriangle(data, front_inner[0], front_inner[1], front_inner[2],
+                    face_color);
+        AddTriangle(data, front_inner[0], front_inner[2], front_inner[3],
+                    face_color);
+        AddTriangle(data, back_inner[0], back_inner[2], back_inner[1],
+                    face_color);
+        AddTriangle(data, back_inner[0], back_inner[3], back_inner[2],
+                    face_color);
+
+        // Face borders and outer side walls.
+        for (int corner = 0; corner < 4; ++corner)
+        {
+            const int next = (corner + 1) % 4;
+            AddTriangle(data, front_inner[corner], front_outer[corner],
+                        front_outer[next], edge_color);
+            AddTriangle(data, front_inner[corner], front_outer[next],
+                        front_inner[next], edge_color);
+            AddTriangle(data, back_inner[corner], back_outer[next],
+                        back_outer[corner], edge_color);
+            AddTriangle(data, back_inner[corner], back_inner[next],
+                        back_outer[next], edge_color);
+
+            AddTriangle(data, back_outer[corner], back_outer[next],
+                        front_outer[next], edge_color);
+            AddTriangle(data, back_outer[corner], front_outer[next],
+                        front_outer[corner], edge_color);
+        }
+    }
+
     static void AddVertex(std::vector<float>& data, const glm::vec3& position,
                           const glm::vec3& color)
     {
@@ -254,16 +378,19 @@ private:
         glBindVertexArray(0);
     }
 
-    glm::vec2 size_mm_{PlateDimensions::kDefaultMm};
+    glm::vec3 size_mm_ = PlateDimensions::DefaultSizeMm();
     GLuint face_vao_ = 0;
     GLuint face_vbo_ = 0;
     GLuint line_vao_ = 0;
     GLuint line_vbo_ = 0;
     GLuint axis_vao_ = 0;
     GLuint axis_vbo_ = 0;
+    GLuint marker_vao_ = 0;
+    GLuint marker_vbo_ = 0;
     GLsizei face_vertex_count_ = 0;
     GLsizei line_vertex_count_ = 0;
     GLsizei axis_vertex_count_ = 0;
+    GLsizei marker_vertex_count_ = 0;
 };
 
 #endif
